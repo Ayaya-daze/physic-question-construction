@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://physics-question-bank/schemas/file-question.schema.json",
+  "title": "File-backed Physics Question",
+  "description": "Minimal file-first question model. The production source of truth is question body, answer body, assets, and optional loose metadata. It does not hard-code question types, options, solution steps, or answer subtypes.",
+  "type": "object",
+  "required": ["question_id", "question_body"],
+  "additionalProperties": false,
+  "properties": {
+    "question_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,120}$",
+      "description": "Directory name under questions/. Must not start with a dot."
+    },
+    "question_body": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Question body as Markdown, LaTeX, or plain text."
+    },
+    "answer_body": {
+      "type": "string",
+      "default": "",
+      "description": "Answer body as Markdown, LaTeX, or plain text. Detailed solution text belongs here if needed."
+    },
+    "question_format": {
+      "type": "string",
+      "enum": ["markdown", "latex", "text"],
+      "default": "markdown"
+    },
+    "answer_format": {
+      "type": "string",
+      "enum": ["markdown", "latex", "text"],
+      "default": "markdown"
+    },
+    "assets": {
+      "type": "array",
+      "description": "Files stored under questions/{question_id}/assets/.",
+      "items": {
+        "type": "object",
+        "required": ["filename"],
+        "additionalProperties": false,
+        "properties": {
+          "filename": {
+            "type": "string",
+            "pattern": "^[^/\\\\]+$"
+          },
+          "mime_hint": {
+            "type": "string"
+          }
+        }
+      },
+      "default": []
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Optional loose metadata such as title, source, knowledge_points, tags, or notes. It is not the core question structure.",
+      "additionalProperties": true,
+      "default": {}
+    }
+  }
+}

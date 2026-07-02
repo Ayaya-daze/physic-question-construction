@@ -1,0 +1,103 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: physics-qb-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: physics_questions
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - physics-qb-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: physics-qb-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - physics-qb-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: physics-qb-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/physics_questions
+      DATABASE_URL_SYNC: postgresql://postgres:postgres@db:5432/physics_questions
+      REDIS_URL: redis://redis:6379/0
+      CORS_ORIGINS: '["http://localhost:3000"]'
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      DEBUG: "false"
+      QUESTIONS_DIR: /data/questions
+      EXPORTS_DIR: /data/exports
+      UPLOAD_DIR: /data/uploads
+      LATEX_ENGINE: xelatex
+      FILE_EXPORT_MAX_WORKERS: "1"
+      LATEX_COMPILE_TIMEOUT_SECONDS: "90"
+      LLM_ENABLED: "${LLM_ENABLED:-false}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-anthropic}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_MODEL: "${LLM_MODEL:-claude-sonnet-4-20250514}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
+      LLM_VISION_ENABLED: "${LLM_VISION_ENABLED:-false}"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - question_data:/data/questions
+      - export_data:/data/exports
+      - upload_data:/data/uploads
+    networks:
+      - physics-qb-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: physics-qb-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      BACKEND_URL: http://backend:8000
+      NEXT_PUBLIC_API_URL: http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - physics-qb-network
+
+volumes:
+  postgres_data:
+  question_data:
+  export_data:
+  upload_data:
+
+networks:
+  physics-qb-network:
+    driver: bridge

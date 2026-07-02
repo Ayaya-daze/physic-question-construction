@@ -1,0 +1,83 @@
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*.py.class
+*$py.class
+.Python
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ==================== Node.js ====================
+node_modules/
+.next/
+next-env.d.ts
+out/
+
+# ==================== IDE ====================
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# ==================== OS ====================
+.DS_Store
+Thumbs.db
+
+# ==================== Docker ====================
+.docker/
+
+# ==================== Project-specific ====================
+uploads/
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.tsbuildinfo
+data/uploads/
+data/fixtures/
+
+# Private source materials and generated documents
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+/*.txt
+
+# Keep .env.example
+!.env.example
+
+# Generated / runtime
+backend/uploads/
+backend/physics_questions.db
+backend/physics_questions.db-*
+physics_questions.db
+physics_questions.db-*
+exports/
+backend/exports/
+tmp/
+output/
+rendered-pages/
+.playwright-cli/
+questions/*
+!questions/.gitkeep
+imports/inbox/*
+imports/jobs/*
+imports/done/*
+imports/failed/*
+!imports/README.md
+!imports/inbox/.gitkeep
+!imports/jobs/.gitkeep
+!imports/done/.gitkeep
+!imports/failed/.gitkeep
+*.pyc
+__pycache__/

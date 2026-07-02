@@ -44,7 +44,7 @@ imports/inbox/
 人类把 PDF、扫描件、Markdown、LaTeX、TXT 或整理好的 `questions.json` 放入该目录。运行：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . run
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . run
 ```
 
 脚本会把每个文件或文件夹转成标准 job：
@@ -69,7 +69,7 @@ imports/jobs/{job_id}/output/assets/*
 再运行：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
 ```
 
 即可自动完成校验、入库、索引重建和归档。

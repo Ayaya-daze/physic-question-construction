@@ -1,0 +1,4 @@
+interface:
+  display_name: "Physics Question Importer"
+  short_description: "Convert physics OCR/PDF sources and inbox drops into simple question files."
+  default_prompt: "Convert this physics source or imports/inbox job into question.md / answer.md / assets / metadata.yaml file-question records."

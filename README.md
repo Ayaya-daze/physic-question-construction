@@ -144,6 +144,14 @@ venv/bin/python scripts/cleanup_runtime_artifacts.py --delete
 
 ### Agent Inbox 自动导入
 
+项目已经内置配套 Codex skill：
+
+```text
+skills/physics-question-importer/
+```
+
+可以直接从仓库运行，也可以复制到 `~/.codex/skills/physics-question-importer` 作为全局 Codex skill 使用。
+
 人类可以把原始资料放入：
 
 ```text
@@ -153,13 +161,13 @@ imports/inbox/
 然后运行：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . run
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . run
 ```
 
 脚本会自动创建标准 job、生成 `AGENT_TASK.md`、自动入库已经整理好的 `questions.json`，并对需要读图的 PDF/扫描件交给 Codex agent + `physics-question-importer` skill 处理。完成输出后运行：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
 ```
 
 项目也保留了兼容包装命令：`PYTHONPATH=backend backend/venv/bin/python backend/scripts/agent_inbox.py run`。

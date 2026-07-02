@@ -84,13 +84,13 @@ imports/inbox/
 运行：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root /Users/ayaya/Documents/Codex/physics-question-bank run
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root /Users/ayaya/Documents/Codex/physics-question-bank run
 ```
 
 如果 job 里是已经整理好的 `questions.json` 和独立图片资产，脚本会自动入库。如果 job 里是扫描 PDF，需要 Codex agent 使用 `physics-question-importer` skill 读取 `AGENT_TASK.md`，输出 `output/questions.json` 和可选 `output/assets/*`，再运行：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root /Users/ayaya/Documents/Codex/physics-question-bank finalize
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root /Users/ayaya/Documents/Codex/physics-question-bank finalize
 ```
 
 原则：

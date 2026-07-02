@@ -55,4 +55,10 @@ Use a vision model for production scanned-paper import. If no vision/manual tran
 }
 ```
 
-The detailed reusable Codex skill lives at `~/.codex/skills/physics-question-importer`.
+The reusable Codex skill is bundled in this repository at:
+
+```text
+skills/physics-question-importer/
+```
+
+It can also be installed globally at `~/.codex/skills/physics-question-importer`.

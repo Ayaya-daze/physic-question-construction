@@ -33,14 +33,14 @@ imports/inbox/ready-batch/
 Commands:
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . init
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . run
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . status
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . init
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . run
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . status
 ```
 
 If a job needs vision/manual work, open its `AGENT_TASK.md`, write
 `output/questions.json`, then run:
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
 ```

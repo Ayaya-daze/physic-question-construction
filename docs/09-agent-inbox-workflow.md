@@ -65,31 +65,31 @@ imports/inbox/第3套-ready/
 初始化目录：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . init
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . init
 ```
 
 扫描 inbox 并自动 finalize 已完成输出：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . run
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . run
 ```
 
 查看状态：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . status
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . status
 ```
 
 只扫描新文件：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . discover
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . discover
 ```
 
 只入库已完成的 job：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
 ```
 
 本项目也保留兼容包装：
@@ -121,7 +121,7 @@ imports/jobs/{job_id}/output/assets/*
 然后运行：
 
 ```bash
-python3 ~/.codex/skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
 ```
 
 成功后 job 会进入 `imports/done/`，题目进入 `questions/`，索引自动重建。

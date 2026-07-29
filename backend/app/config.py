@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     # endpoints vary, so require an explicit opt-in before sending images.
     LLM_VISION_ENABLED: bool = False
 
+    # ── Embedding API / Local Retrieval ───────────────────────────────
+    EMBEDDING_ENABLED: bool = False
+    EMBEDDING_API_KEY: str = ""
+    EMBEDDING_BASE_URL: str = "https://api.openai.com/v1"
+    EMBEDDING_MODEL: str = ""
+    EMBEDDING_BATCH_SIZE: int = 64
+    EMBEDDING_TIMEOUT_SECONDS: int = 60
+
     # ── Paper Generation / Export ───────────────────────────────────────
     EXPORTS_DIR: str = "./exports"
     LATEX_ENGINE: str = "xelatex"  # xelatex or lualatex

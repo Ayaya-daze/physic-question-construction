@@ -14,6 +14,8 @@ import re
 import shutil
 import subprocess
 import asyncio
+import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,8 +27,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.database import async_session_factory
-from app.models.question import Question
 from app.services.file_question_store import (
     INDEX_PATH,
     LOCAL_VECTOR_MODEL,
@@ -39,6 +39,21 @@ from app.services.file_question_store import (
     search_questions,
     validate_question_id,
     write_question,
+)
+from app.services.file_question_candidates import (
+    approve_candidate,
+    candidate_asset_path,
+    list_candidates,
+    read_candidate,
+    reject_candidate,
+    validate_candidate_id,
+)
+from app.services.file_knowledge_points import (
+    list_knowledge_points,
+    merge_knowledge_points,
+    question_ids_for_knowledge_point,
+    rebuild_knowledge_points,
+    rename_knowledge_point,
 )
 from app.services.file_question_importer import (
     SUPPORTED_EXTENSIONS,
@@ -53,6 +68,7 @@ from app.services.file_import_jobs import (
     kick_worker,
     list_jobs as list_import_jobs,
     mark_job_queued,
+    record_candidate_resolution,
     read_job,
     source_type_or_error,
     validate_job_id,
@@ -138,6 +154,24 @@ class FileQuestionStats(BaseModel):
     indexed: int
     with_assets: int
     human_review_needed: int
+    pending_review: int
+
+
+class FileKnowledgePointRead(BaseModel):
+    knowledge_point_id: str
+    name: str
+    aliases: list[str] = Field(default_factory=list)
+    question_ids: list[str] = Field(default_factory=list)
+    count: int
+
+
+class FileKnowledgePointRename(BaseModel):
+    name: str = Field(..., min_length=1, max_length=160)
+
+
+class FileKnowledgePointMerge(BaseModel):
+    source_id: str
+    target_id: str
 
 
 class FileQuestionImportItem(FileQuestionSummary):
@@ -151,11 +185,13 @@ class FileQuestionImportError(BaseModel):
 
 class FileQuestionImportResponse(BaseModel):
     imported: list[FileQuestionImportItem] = Field(default_factory=list)
+    pending_review: list["FileQuestionCandidateRead"] = Field(default_factory=list)
     errors: list[FileQuestionImportError] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     llm_assist_requested: bool
     llm_assist_used: bool
     question_count: int
+    review_count: int
 
 
 class FileImportJobSource(BaseModel):
@@ -181,7 +217,9 @@ class FileImportJobRead(BaseModel):
     processed_files: int
     current_file: str | None = None
     created_question_ids: list[str] = Field(default_factory=list)
+    candidate_ids: list[str] = Field(default_factory=list)
     imported_count: int
+    review_count: int = 0
     errors: list[FileQuestionImportError] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     llm_used: bool = False
@@ -192,6 +230,47 @@ class FileQuestionUpdate(BaseModel):
     """Schema for updating a file-backed question's body/answer."""
     question_body: str | None = None
     answer_body: str | None = None
+
+
+class FileQuestionCandidateRead(BaseModel):
+    candidate_id: str
+    state: str
+    question_body: str
+    answer_body: str = ""
+    question_format: str = "markdown"
+    answer_format: str | None = None
+    metadata: dict = Field(default_factory=dict)
+    assets: list[dict] = Field(default_factory=list)
+    proposed_question_id: str
+    source_filename: str
+    source_type: str
+    source_document_hash: str
+    warnings: list[str] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+    reviewed_at: str | None = None
+    committed_at: str | None = None
+    committed_question_id: str | None = None
+    rejection_reason: str | None = None
+
+
+class FileQuestionCandidateApprove(BaseModel):
+    question_body: str | None = None
+    answer_body: str | None = None
+    metadata: dict | None = None
+    acknowledge_warnings: bool = False
+
+
+class FileQuestionCandidateReject(BaseModel):
+    reason: str = ""
+
+
+class FileQuestionCandidateCommitResponse(BaseModel):
+    candidate: FileQuestionCandidateRead
+    question: FileQuestionRead
+
+
+FileQuestionImportResponse.model_rebuild()
 
 
 def _job_read(manifest: dict) -> FileImportJobRead:
@@ -216,7 +295,13 @@ def _job_read(manifest: dict) -> FileImportJobRead:
             for item in manifest.get("created_question_ids", [])
             if item
         ],
+        candidate_ids=[
+            str(item)
+            for item in manifest.get("candidate_ids", [])
+            if item
+        ],
         imported_count=int(manifest.get("imported_count") or 0),
+        review_count=int(manifest.get("review_count") or 0),
         errors=[
             FileQuestionImportError(
                 filename=str(item.get("filename") or ""),
@@ -262,6 +347,9 @@ class FilePaperResponse(BaseModel):
     answer_tex_url: str
     answer_pdf_url: str | None = None
     answer_build_log_url: str | None = None
+    manifest_url: str
+    question_compile_error_id: str | None = None
+    answer_compile_error_id: str | None = None
 
     # ── Legacy compat fields ──
     tex_path: str = ""
@@ -297,6 +385,10 @@ def _detail(question: FileQuestion) -> FileQuestionRead:
     )
 
 
+def _candidate_read(payload: dict) -> FileQuestionCandidateRead:
+    return FileQuestionCandidateRead.model_validate(payload)
+
+
 def _format_from_filename(filename: str | None) -> str:
     suffix = Path(filename or "").suffix.lower()
     if suffix in {".tex", ".latex"}:
@@ -317,11 +409,20 @@ def _import_item(source_filename: str, question: FileQuestion) -> FileQuestionIm
 @router.get("/", response_model=PaginatedFileQuestions)
 async def list_file_questions(
     q: str | None = Query(None, description="Search text"),
+    knowledge_point_id: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=200),
 ):
     """List or search file-backed questions."""
     items = search_questions(q or "", limit=10_000)
+    if knowledge_point_id:
+        try:
+            allowed_ids = question_ids_for_knowledge_point(knowledge_point_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Knowledge point not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        items = [item for item in items if item.question_id in allowed_ids]
     page = items[skip : skip + limit]
     return PaginatedFileQuestions(
         items=[_summary(item) for item in page],
@@ -408,7 +509,57 @@ async def get_file_question_stats():
             for question in questions
             if bool(question.metadata.get("human_review_needed"))
         ),
+        pending_review=len(list_candidates(state="needs_review", limit=100_000)),
     )
+
+
+@router.get("/knowledge-points", response_model=list[FileKnowledgePointRead])
+async def get_file_knowledge_points():
+    return [
+        FileKnowledgePointRead.model_validate(item)
+        for item in list_knowledge_points()
+    ]
+
+
+@router.post("/knowledge-points/rebuild", response_model=list[FileKnowledgePointRead])
+async def rebuild_file_knowledge_points():
+    payload = rebuild_knowledge_points()
+    return [
+        FileKnowledgePointRead.model_validate(item)
+        for item in payload.get("items", [])
+    ]
+
+
+@router.patch(
+    "/knowledge-points/{knowledge_point_id}",
+    response_model=FileKnowledgePointRead,
+)
+async def rename_file_knowledge_point(
+    knowledge_point_id: str,
+    payload: FileKnowledgePointRename,
+):
+    try:
+        return FileKnowledgePointRead.model_validate(
+            rename_knowledge_point(knowledge_point_id, payload.name)
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Knowledge point not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/knowledge-points/merge", response_model=list[FileKnowledgePointRead])
+async def merge_file_knowledge_points(payload: FileKnowledgePointMerge):
+    try:
+        result = merge_knowledge_points(payload.source_id, payload.target_id)
+        return [
+            FileKnowledgePointRead.model_validate(item)
+            for item in result.get("items", [])
+        ]
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Knowledge point not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/import/config", response_model=FileImportConfig)
@@ -418,43 +569,6 @@ async def get_file_import_config():
         **llm_import_config(),
         supported_extensions=sorted(SUPPORTED_EXTENSIONS),
     )
-
-
-async def _sync_file_question_to_db(question_id: str, title: str, stem: str, metadata: dict) -> None:
-    """Create/update a DB Question row so the paper generator can find file questions."""
-    from datetime import datetime as _dt
-    try:
-        async with async_session_factory() as db:
-            # Check if already synced
-            from sqlalchemy import select as _select
-            existing = await db.execute(
-                _select(Question).where(Question.canonical_id == question_id)
-            )
-            q = existing.scalar_one_or_none()
-
-            difficulty = metadata.get("difficulty", 3) or 3
-            question_type = metadata.get("question_type", "calculation") or "calculation"
-
-            if q is not None:
-                # Update existing
-                q.stem = stem[:2000]
-                q.difficulty = difficulty
-                q.question_type = question_type
-                q.updated_at = _dt.now(timezone.utc)
-            else:
-                q = Question(
-                    canonical_id=question_id,
-                    status="approved",
-                    stem=stem[:2000],
-                    question_type=question_type,
-                    difficulty=difficulty,
-                    created_at=_dt.now(timezone.utc),
-                    updated_at=_dt.now(timezone.utc),
-                )
-                db.add(q)
-            await db.commit()
-    except Exception:
-        pass  # sync is best-effort, never block the import
 
 
 @router.post("/import", response_model=FileQuestionImportResponse)
@@ -467,6 +581,7 @@ async def import_file_questions(
     imported: list[FileQuestionImportItem] = []
     errors: list[FileQuestionImportError] = []
     warnings: list[str] = []
+    pending_review: list[FileQuestionCandidateRead] = []
     llm_used = False
 
     batch_dir = settings.upload_dir / "file-imports" / (datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_") + uuid4().hex[:8])
@@ -531,14 +646,7 @@ async def import_file_questions(
                 _import_item(filename, read_question(question.question_id))
                 for question in result.questions
             )
-            # Sync to DB so paper generator can find these questions
-            for question in result.questions:
-                await _sync_file_question_to_db(
-                    question.question_id,
-                    question.title,
-                    question.question_body,
-                    question.metadata,
-                )
+            pending_review.extend(_candidate_read(item) for item in result.candidates)
             warnings.extend(f"{filename}: {warning}" for warning in result.warnings)
         except LLMNotConfiguredError as exc:
             errors.append(FileQuestionImportError(filename=filename, error=str(exc)))
@@ -550,11 +658,13 @@ async def import_file_questions(
 
     return FileQuestionImportResponse(
         imported=imported,
+        pending_review=pending_review,
         errors=errors,
         warnings=warnings,
         llm_assist_requested=use_llm_assist,
         llm_assist_used=llm_used,
         question_count=len(imported),
+        review_count=len(pending_review),
     )
 
 
@@ -620,6 +730,93 @@ async def get_file_import_job(job_id: str):
         return _job_read(read_job(job_id))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Import job not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/import/candidates", response_model=list[FileQuestionCandidateRead])
+async def get_file_question_candidates(
+    state: str | None = Query("needs_review"),
+    limit: int = Query(100, ge=1, le=1000),
+):
+    """List file-question import candidates waiting for explicit review."""
+    try:
+        return [_candidate_read(item) for item in list_candidates(state=state, limit=limit)]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get(
+    "/import/candidates/{candidate_id}",
+    response_model=FileQuestionCandidateRead,
+)
+async def get_file_question_candidate(candidate_id: str):
+    try:
+        validate_candidate_id(candidate_id)
+        return _candidate_read(read_candidate(candidate_id))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Import candidate not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/import/candidates/{candidate_id}/assets/{asset_name}")
+async def get_file_question_candidate_asset(candidate_id: str, asset_name: str):
+    try:
+        return FileResponse(candidate_asset_path(candidate_id, asset_name))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Candidate asset not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/import/candidates/{candidate_id}/approve",
+    response_model=FileQuestionCandidateCommitResponse,
+)
+async def approve_file_question_candidate(
+    candidate_id: str,
+    payload: FileQuestionCandidateApprove,
+):
+    try:
+        candidate, question = approve_candidate(
+            candidate_id,
+            question_body=payload.question_body,
+            answer_body=payload.answer_body,
+            metadata=payload.metadata,
+            acknowledge_warnings=payload.acknowledge_warnings,
+        )
+        rebuild_index()
+        record_candidate_resolution(
+            candidate_id,
+            question_id=question.question_id,
+        )
+        return FileQuestionCandidateCommitResponse(
+            candidate=_candidate_read(candidate),
+            question=_detail(read_question(question.question_id)),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Import candidate not found") from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/import/candidates/{candidate_id}/reject",
+    response_model=FileQuestionCandidateRead,
+)
+async def reject_file_question_candidate(
+    candidate_id: str,
+    payload: FileQuestionCandidateReject,
+):
+    try:
+        candidate = reject_candidate(candidate_id, payload.reason)
+        record_candidate_resolution(candidate_id, rejected=True)
+        return _candidate_read(candidate)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Import candidate not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -837,6 +1034,53 @@ def _rewrite_latex_asset_paths(body: str, question_id: str) -> str:
     return re.sub(r"\\includegraphics(\[[^\]]*\])?\{([^}]+)\}", repl, body)
 
 
+def _referenced_export_assets(question: FileQuestion) -> set[str]:
+    raw_paths = set(
+        re.findall(
+            r"!\[[^\]]*\]\(([^)]+)\)|\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}",
+            f"{question.question_body}\n{question.answer_body}",
+        )
+    )
+    names: set[str] = set()
+    for markdown_path, latex_path in raw_paths:
+        raw_path = (markdown_path or latex_path).strip()
+        if not raw_path:
+            continue
+        if re.match(r"^[a-z]+://", raw_path, re.IGNORECASE) or Path(raw_path).is_absolute():
+            raise HTTPException(
+                status_code=422,
+                detail=f"Question {question.question_id} references a non-local image: {raw_path}",
+            )
+        relative = Path(raw_path)
+        if ".." in relative.parts:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Question {question.question_id} contains an unsafe image path: {raw_path}",
+            )
+        filename = relative.name
+        if _looks_like_rendered_pdf_page(filename):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Question {question.question_id} references a rendered whole PDF page: "
+                    f"{filename}"
+                ),
+            )
+        names.add(filename)
+
+    available = {asset.filename for asset in question.assets}
+    missing = sorted(names - available)
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Question {question.question_id} is missing referenced assets: "
+                + ", ".join(missing)
+            ),
+        )
+    return names
+
+
 def _resolve_export_questions(payload: FilePaperRequest) -> list[str]:
     selected: list[str] = []
     seen: set[str] = set()
@@ -894,112 +1138,214 @@ async def export_file_paper(payload: FilePaperRequest):
     """
     load_or_rebuild_index()
     resolved_question_ids = _resolve_export_questions(payload)
-    export_id = datetime.now(timezone.utc).strftime("filepaper_%Y%m%d_%H%M%S_") + uuid4().hex[:8]
-    out_dir = settings.exports_dir / "file-papers" / export_id
-    assets_out = out_dir / "assets"
-    assets_out.mkdir(parents=True, exist_ok=True)
-
-    # ── Build question and answer bodies ──────────────────────────────────
-    question_parts: list[str] = [r"\section*{题目}"]
-    answer_parts: list[str] = [r"\section*{答案}"]
-
-    resolved_questions: list[tuple[str, FileQuestion]] = []
+    resolved_questions: list[tuple[str, FileQuestion, set[str]]] = []
     original_number_counts: dict[str, int] = {}
+
     for question_id in resolved_question_ids:
         try:
             qid = validate_question_id(question_id)
             question = read_question(qid)
+            referenced_assets = _referenced_export_assets(question)
+            for filename in referenced_assets:
+                asset_path(qid, filename)
         except (FileNotFoundError, ValueError) as exc:
-            raise HTTPException(status_code=404, detail=f"Question not found: {question_id}") from exc
-        resolved_questions.append((qid, question))
+            raise HTTPException(
+                status_code=404,
+                detail=f"Question or referenced asset not found: {question_id}",
+            ) from exc
+        resolved_questions.append((qid, question, referenced_assets))
         original_number = _original_problem_number(question)
         if original_number:
-            original_number_counts[original_number] = original_number_counts.get(original_number, 0) + 1
+            original_number_counts[original_number] = (
+                original_number_counts.get(original_number, 0) + 1
+            )
 
-    for index, (qid, question) in enumerate(resolved_questions, start=1):
-        # Copy assets (best-effort — non-fatal if a single asset is missing)
-        question_assets_out = assets_out / qid
-        question_assets_out.mkdir(parents=True, exist_ok=True)
-        for asset in question.assets:
-            if _looks_like_rendered_pdf_page(asset.filename):
-                continue
+    export_id = (
+        datetime.now(timezone.utc).strftime("filepaper_%Y%m%d_%H%M%S_")
+        + uuid4().hex[:8]
+    )
+    exports_root = settings.exports_dir / "file-papers"
+    staging_root = exports_root / ".staging"
+    exports_root.mkdir(parents=True, exist_ok=True)
+    staging_root.mkdir(exist_ok=True)
+    out_dir = exports_root / export_id
+    work_dir = staging_root / f"{export_id}.{uuid4().hex}.tmp"
+    assets_out = work_dir / "assets"
+    work_dir.mkdir()
+    assets_out.mkdir()
+
+    try:
+        question_parts: list[str] = [r"\section*{题目}"]
+        answer_parts: list[str] = [r"\section*{答案}"]
+        manifest_questions: list[dict] = []
+
+        for index, (qid, question, referenced_assets) in enumerate(
+            resolved_questions,
+            start=1,
+        ):
+            asset_manifest: list[dict] = []
+            if referenced_assets:
+                question_assets_out = assets_out / qid
+                question_assets_out.mkdir()
+                for filename in sorted(referenced_assets):
+                    src = asset_path(qid, filename)
+                    destination = question_assets_out / filename
+                    shutil.copy2(src, destination)
+                    asset_manifest.append(
+                        {
+                            "filename": filename,
+                            "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+                            "size_bytes": destination.stat().st_size,
+                        }
+                    )
+
+            original_number = _original_problem_number(question)
+            heading = _paper_question_heading(
+                question,
+                index,
+                duplicate_original_number=bool(
+                    original_number
+                    and original_number_counts.get(original_number, 0) > 1
+                ),
+            )
+            marker = rf"\typeout{{PHYSBANK_QUESTION_ID={qid}}}"
+            question_parts.extend(
+                [
+                    marker,
+                    r"\subsection*{" + _escape_text_preserving_math(heading) + "}",
+                    _body_to_tex(question.question_body, question.question_format, qid),
+                ]
+            )
+            answer_parts.extend(
+                [
+                    marker,
+                    r"\subsection*{" + _escape_text_preserving_math(heading) + "}",
+                    (
+                        _body_to_tex(
+                            question.answer_body,
+                            question.answer_format,
+                            qid,
+                        )
+                        if question.answer_body
+                        else r"\textit{未提供答案。}"
+                    ),
+                ]
+            )
+            manifest_questions.append(
+                {
+                    "order": index,
+                    "question_id": qid,
+                    "content_hash": question.content_hash,
+                    "source_filename": question.metadata.get("source_filename"),
+                    "source_document_hash": question.metadata.get(
+                        "source_document_hash"
+                    ),
+                    "assets": asset_manifest,
+                }
+            )
+
+        questions_tex_path = work_dir / "questions.tex"
+        questions_tex_path.write_text(
+            _paper_template(payload.title, "\n\n".join(question_parts)),
+            encoding="utf-8",
+        )
+        answers_tex_path = work_dir / "answers.tex"
+        answers_tex_path.write_text(
+            _paper_template(payload.title + " - 参考答案", "\n\n".join(answer_parts)),
+            encoding="utf-8",
+        )
+
+        engine = settings.LATEX_ENGINE or "xelatex"
+
+        def _compile(tex_path: Path, log_name: str) -> tuple[bool, str | None]:
+            log_path = work_dir / log_name
             try:
-                src = asset_path(qid, asset.filename)
-                shutil.copy2(src, question_assets_out / asset.filename)
-            except FileNotFoundError:
-                pass  # missing assets don't block export
-
-        # Question body
-        original_number = _original_problem_number(question)
-        heading = _paper_question_heading(
-            question,
-            index,
-            duplicate_original_number=bool(original_number and original_number_counts.get(original_number, 0) > 1),
-        )
-        question_parts.append(r"\subsection*{" + _escape_text_preserving_math(heading) + "}")
-        question_parts.append(_body_to_tex(question.question_body, question.question_format, qid))
-
-        # Answer body (always built even if include_answers=False, for answer-only paper)
-        answer_parts.append(r"\subsection*{" + _escape_text_preserving_math(heading) + "}")
-        answer_parts.append(
-            _body_to_tex(question.answer_body, question.answer_format, qid)
-            if question.answer_body
-            else r"\textit{未提供答案。}"
-        )
-
-    # ── Generate questions.tex ────────────────────────────────────────────
-    questions_tex_path = out_dir / "questions.tex"
-    questions_tex_path.write_text(
-        _paper_template(payload.title, "\n\n".join(question_parts)), encoding="utf-8"
-    )
-
-    # ── Generate answers.tex ──────────────────────────────────────────────
-    answer_title = payload.title + " — 参考答案"
-    answers_tex_path = out_dir / "answers.tex"
-    answers_tex_path.write_text(
-        _paper_template(answer_title, "\n\n".join(answer_parts)), encoding="utf-8"
-    )
-
-    # ── Compile ───────────────────────────────────────────────────────────
-    engine = settings.LATEX_ENGINE or "xelatex"
-
-    def _compile(tex_path: Path, log_name: str) -> Path | None:
-        log_path = out_dir / log_name
-        try:
-            with _TEX_COMPILE_GATE:
-                proc = subprocess.run(
-                    [engine, "-interaction=nonstopmode", "-halt-on-error", tex_path.name],
-                    cwd=out_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=max(1, int(settings.LATEX_COMPILE_TIMEOUT_SECONDS or 90)),
-                    check=False,
+                with _TEX_COMPILE_GATE:
+                    proc = subprocess.run(
+                        [
+                            engine,
+                            "-interaction=nonstopmode",
+                            "-halt-on-error",
+                            tex_path.name,
+                        ],
+                        cwd=work_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=max(
+                            1,
+                            int(settings.LATEX_COMPILE_TIMEOUT_SECONDS or 90),
+                        ),
+                        check=False,
+                    )
+                build_log = proc.stdout + "\n" + proc.stderr
+                log_path.write_text(build_log, encoding="utf-8")
+                markers = re.findall(
+                    r"PHYSBANK_QUESTION_ID=([A-Za-z0-9_.-]+)",
+                    build_log,
                 )
-            build_log = proc.stdout + "\n" + proc.stderr
-            log_path.write_text(build_log, encoding="utf-8")
-            pdf_candidate = out_dir / tex_path.with_suffix(".pdf").name
-            if proc.returncode == 0 and pdf_candidate.exists():
-                return pdf_candidate
-            return None
-        except Exception as exc:
-            log_path.write_text(str(exc), encoding="utf-8")
-            return None
+                pdf_candidate = work_dir / tex_path.with_suffix(".pdf").name
+                success = proc.returncode == 0 and pdf_candidate.exists()
+                return success, None if success or not markers else markers[-1]
+            except Exception as exc:
+                log_path.write_text(str(exc), encoding="utf-8")
+                return False, None
 
-    async def _compile_async(tex_path: Path, log_name: str) -> Path | None:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            _TEX_COMPILE_EXECUTOR,
-            _compile,
-            tex_path,
-            log_name,
+        async def _compile_async(
+            tex_path: Path,
+            log_name: str,
+        ) -> tuple[bool, str | None]:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                _TEX_COMPILE_EXECUTOR,
+                _compile,
+                tex_path,
+                log_name,
+            )
+
+        question_build, answer_build = await asyncio.gather(
+            _compile_async(questions_tex_path, "build-questions.log"),
+            _compile_async(answers_tex_path, "build-answers.log"),
         )
+        question_succeeded, question_error_id = question_build
+        answer_succeeded, answer_error_id = answer_build
+        both_succeeded = question_succeeded and answer_succeeded
 
-    questions_pdf_path, answers_pdf_path = await asyncio.gather(
-        _compile_async(questions_tex_path, "build-questions.log"),
-        _compile_async(answers_tex_path, "build-answers.log"),
-    )
+        manifest = {
+            "version": 1,
+            "template_version": "file-paper-v2",
+            "export_id": export_id,
+            "title": payload.title,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "question_count": len(resolved_questions),
+            "questions": manifest_questions,
+            "artifacts": {
+                "questions_tex": "questions.tex",
+                "questions_pdf": "questions.pdf" if question_succeeded else None,
+                "answers_tex": "answers.tex",
+                "answers_pdf": "answers.pdf" if answer_succeeded else None,
+                "question_build_log": "build-questions.log",
+                "answer_build_log": "build-answers.log",
+            },
+            "compile": {
+                "engine": engine,
+                "questions_succeeded": question_succeeded,
+                "answers_succeeded": answer_succeeded,
+                "question_error_id": question_error_id,
+                "answer_error_id": answer_error_id,
+            },
+        }
+        (work_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        work_dir.replace(out_dir)
+    except Exception:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
 
-    both_succeeded = questions_pdf_path is not None and answers_pdf_path is not None
+    questions_pdf_path = out_dir / "questions.pdf" if question_succeeded else None
+    answers_pdf_path = out_dir / "answers.pdf" if answer_succeeded else None
+    question_tex_path = out_dir / "questions.tex"
 
     return FilePaperResponse(
         status="succeeded" if both_succeeded else "tex_only",
@@ -1007,29 +1353,39 @@ async def export_file_paper(payload: FilePaperRequest):
         title=payload.title,
         question_count=len(resolved_question_ids),
         question_ids=resolved_question_ids,
-        # New split outputs
         question_tex_url=f"/api/file-questions/papers/exports/{export_id}/questions.tex",
         question_pdf_url=(
             f"/api/file-questions/papers/exports/{export_id}/questions.pdf"
-            if questions_pdf_path else None
+            if questions_pdf_path
+            else None
         ),
-        question_build_log_url=f"/api/file-questions/papers/exports/{export_id}/build-questions.log",
+        question_build_log_url=(
+            f"/api/file-questions/papers/exports/{export_id}/build-questions.log"
+        ),
         answer_tex_url=f"/api/file-questions/papers/exports/{export_id}/answers.tex",
         answer_pdf_url=(
             f"/api/file-questions/papers/exports/{export_id}/answers.pdf"
-            if answers_pdf_path else None
+            if answers_pdf_path
+            else None
         ),
-        answer_build_log_url=f"/api/file-questions/papers/exports/{export_id}/build-answers.log",
-        # Legacy compat — point at questions files
-        tex_path=str(questions_tex_path),
+        answer_build_log_url=(
+            f"/api/file-questions/papers/exports/{export_id}/build-answers.log"
+        ),
+        manifest_url=f"/api/file-questions/papers/exports/{export_id}/manifest.json",
+        question_compile_error_id=question_error_id,
+        answer_compile_error_id=answer_error_id,
+        tex_path=str(question_tex_path),
         tex_url=f"/api/file-questions/papers/exports/{export_id}/questions.tex",
         pdf_path=str(questions_pdf_path) if questions_pdf_path else None,
         pdf_url=(
             f"/api/file-questions/papers/exports/{export_id}/questions.pdf"
-            if questions_pdf_path else None
+            if questions_pdf_path
+            else None
         ),
         build_log_path=str(out_dir / "build-questions.log"),
-        build_log_url=f"/api/file-questions/papers/exports/{export_id}/build-questions.log",
+        build_log_url=(
+            f"/api/file-questions/papers/exports/{export_id}/build-questions.log"
+        ),
     )
 
 
@@ -1037,19 +1393,24 @@ async def export_file_paper(payload: FilePaperRequest):
 async def get_file_paper_export(export_id: str, filename: str):
     """Download a generated file-question paper artifact.
 
-    Supports: questions.tex, questions.pdf, build-questions.log,
-    answers.tex, answers.pdf, build-answers.log, and legacy paper.tex / paper.pdf.
+    Supports question/answer TeX, PDFs, build logs, and ``manifest.json``.
     """
     if not re.fullmatch(r"filepaper_[A-Za-z0-9_]+", export_id):
         raise HTTPException(status_code=400, detail="Invalid export id")
     if filename not in {
         "questions.tex", "questions.pdf", "build-questions.log",
         "answers.tex", "answers.pdf", "build-answers.log",
+        "manifest.json",
         "paper.tex", "paper.pdf", "build.log",  # legacy compat
     }:
         raise HTTPException(status_code=400, detail="Invalid export filename")
     path = settings.exports_dir / "file-papers" / export_id / filename
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Export artifact not found")
-    media_type = "application/pdf" if filename.endswith(".pdf") else "text/plain; charset=utf-8"
+    if filename.endswith(".pdf"):
+        media_type = "application/pdf"
+    elif filename.endswith(".json"):
+        media_type = "application/json"
+    else:
+        media_type = "text/plain; charset=utf-8"
     return FileResponse(path, media_type=media_type, filename=filename)

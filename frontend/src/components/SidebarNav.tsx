@@ -2,11 +2,12 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Book, BookOpen, FileText, Home, Upload } from 'lucide-react';
+import { Book, BookOpen, FileText, Home, ListTree, Upload } from 'lucide-react';
 
 const navItems = [
   { href: '/', label: '首页', icon: Home },
   { href: '/questions', label: '题库', icon: BookOpen },
+  { href: '/knowledge-points', label: '知识点', icon: ListTree },
   { href: '/papers/generator', label: '组卷', icon: FileText },
   { href: '/upload', label: '导入资料', icon: Upload },
 ] as const;

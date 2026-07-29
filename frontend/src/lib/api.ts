@@ -157,13 +157,37 @@ export interface FileQuestionImportItem extends FileQuestionSummary {
   source_filename: string;
 }
 
+export interface FileQuestionCandidate {
+  candidate_id: string;
+  state: 'needs_review' | 'approved' | 'committed' | 'rejected';
+  question_body: string;
+  answer_body: string;
+  question_format: 'markdown' | 'latex' | 'text';
+  answer_format?: 'markdown' | 'latex' | 'text' | null;
+  metadata: Record<string, unknown>;
+  assets: Array<{ filename: string; sha256: string; size_bytes: number }>;
+  proposed_question_id: string;
+  source_filename: string;
+  source_type: string;
+  source_document_hash: string;
+  warnings: string[];
+  created_at: string;
+  updated_at: string;
+  reviewed_at?: string | null;
+  committed_at?: string | null;
+  committed_question_id?: string | null;
+  rejection_reason?: string | null;
+}
+
 export interface FileQuestionImportResponse {
   imported: FileQuestionImportItem[];
+  pending_review: FileQuestionCandidate[];
   errors: Array<{ filename: string; error: string }>;
   warnings: string[];
   llm_assist_requested: boolean;
   llm_assist_used: boolean;
   question_count: number;
+  review_count: number;
 }
 
 export interface FileQuestionStats {
@@ -171,6 +195,15 @@ export interface FileQuestionStats {
   indexed: number;
   with_assets: number;
   human_review_needed: number;
+  pending_review: number;
+}
+
+export interface FileKnowledgePoint {
+  knowledge_point_id: string;
+  name: string;
+  aliases: string[];
+  question_ids: string[];
+  count: number;
 }
 
 export interface FileImportJobSource {
@@ -196,7 +229,9 @@ export interface FileImportJob {
   processed_files: number;
   current_file?: string | null;
   created_question_ids: string[];
+  candidate_ids: string[];
   imported_count: number;
+  review_count: number;
   errors: Array<{ filename: string; error: string }>;
   warnings: string[];
   llm_used: boolean;
@@ -262,11 +297,13 @@ export async function getQuestion(id: number | string): Promise<Question> {
 
 export async function getFileQuestions(params: {
   q?: string;
+  knowledge_point_id?: string;
   skip?: number;
   limit?: number;
 } = {}): Promise<PaginatedResponse<FileQuestionSummary>> {
   const searchParams = new URLSearchParams();
   if (params.q) searchParams.set('q', params.q);
+  if (params.knowledge_point_id) searchParams.set('knowledge_point_id', params.knowledge_point_id);
   if (params.skip !== undefined) searchParams.set('skip', String(params.skip));
   if (params.limit !== undefined) searchParams.set('limit', String(params.limit));
   const query = searchParams.toString();
@@ -279,6 +316,36 @@ export async function getFileQuestion(id: string): Promise<FileQuestionDetail> {
 
 export async function getFileQuestionStats(): Promise<FileQuestionStats> {
   return apiFetch<FileQuestionStats>('/api/file-questions/stats');
+}
+
+export async function getFileKnowledgePoints(): Promise<FileKnowledgePoint[]> {
+  return apiFetch<FileKnowledgePoint[]>('/api/file-questions/knowledge-points');
+}
+
+export async function rebuildFileKnowledgePoints(): Promise<FileKnowledgePoint[]> {
+  return apiFetch<FileKnowledgePoint[]>('/api/file-questions/knowledge-points/rebuild', {
+    method: 'POST',
+  });
+}
+
+export async function renameFileKnowledgePoint(
+  knowledgePointId: string,
+  name: string
+): Promise<FileKnowledgePoint> {
+  return apiFetch<FileKnowledgePoint>(`/api/file-questions/knowledge-points/${knowledgePointId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name }),
+  });
+}
+
+export async function mergeFileKnowledgePoints(
+  sourceId: string,
+  targetId: string
+): Promise<FileKnowledgePoint[]> {
+  return apiFetch<FileKnowledgePoint[]>('/api/file-questions/knowledge-points/merge', {
+    method: 'POST',
+    body: JSON.stringify({ source_id: sourceId, target_id: targetId }),
+  });
 }
 
 export async function updateFileQuestion(id: string, data: { question_body?: string; answer_body?: string }): Promise<FileQuestionDetail> {
@@ -341,6 +408,40 @@ export async function listFileImportJobs(limit = 20): Promise<FileImportJob[]> {
   return apiFetch<FileImportJob[]>(`/api/file-questions/import/jobs?limit=${limit}`);
 }
 
+export async function listFileQuestionCandidates(
+  state: FileQuestionCandidate['state'] | '' = 'needs_review',
+  limit = 200
+): Promise<FileQuestionCandidate[]> {
+  const search = new URLSearchParams({ limit: String(limit) });
+  if (state) search.set('state', state);
+  return apiFetch<FileQuestionCandidate[]>(`/api/file-questions/import/candidates?${search}`);
+}
+
+export async function approveFileQuestionCandidate(
+  candidateId: string,
+  data: {
+    question_body?: string;
+    answer_body?: string;
+    metadata?: Record<string, unknown>;
+    acknowledge_warnings?: boolean;
+  }
+): Promise<{ candidate: FileQuestionCandidate; question: FileQuestionDetail }> {
+  return apiFetch(`/api/file-questions/import/candidates/${candidateId}/approve`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function rejectFileQuestionCandidate(
+  candidateId: string,
+  reason = ''
+): Promise<FileQuestionCandidate> {
+  return apiFetch(`/api/file-questions/import/candidates/${candidateId}/reject`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
+}
+
 
 export async function exportFilePaper(data: {
   title: string;
@@ -360,6 +461,9 @@ export async function exportFilePaper(data: {
   answer_tex_url: string;
   answer_pdf_url?: string | null;
   answer_build_log_url?: string | null;
+  manifest_url: string;
+  question_compile_error_id?: string | null;
+  answer_compile_error_id?: string | null;
   // Legacy compat
   tex_path: string;
   tex_url: string;

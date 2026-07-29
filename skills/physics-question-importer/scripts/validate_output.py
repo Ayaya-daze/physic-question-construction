@@ -87,6 +87,9 @@ def validate(records: list[dict]) -> list[str]:
             not isinstance(pages, list) or not all(isinstance(v, int) and v > 0 for v in pages)
         ):
             errors.append(f"{prefix}: metadata.source_pages must be a list of positive integers")
+        review_needed = metadata.get("human_review_needed")
+        if review_needed is not None and not isinstance(review_needed, bool):
+            errors.append(f"{prefix}: metadata.human_review_needed must be a boolean when present")
         if isinstance(question_body, str) and re.search(r"\\frac|\\theta|\\omega|\\alpha|\\Delta", question_body):
             if "$" not in question_body and r"\[" not in question_body:
                 errors.append(f"{prefix}: LaTeX-like content appears without math delimiters")

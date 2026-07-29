@@ -58,19 +58,20 @@ def slugify(value: str) -> str:
     return slug[:60] or "source"
 
 
-def short_hash(path: Path) -> str:
-    digest = hashlib.sha1()
+def source_digest(path: Path) -> str:
+    digest = hashlib.sha256()
     if path.is_file():
         with path.open("rb") as handle:
-            digest.update(handle.read(1024 * 1024))
-        digest.update(path.name.encode("utf-8"))
-        digest.update(str(path.stat().st_size).encode("ascii"))
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
     else:
-        digest.update(path.name.encode("utf-8"))
-        for child in sorted(p for p in path.rglob("*") if p.is_file())[:100]:
+        for child in sorted(p for p in path.rglob("*") if p.is_file()):
             digest.update(str(child.relative_to(path)).encode("utf-8", errors="ignore"))
             digest.update(str(child.stat().st_size).encode("ascii"))
-    return digest.hexdigest()[:8]
+            with child.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
 
 
 def ensure_layout(imports_dir: Path) -> dict[str, Path]:
@@ -272,7 +273,8 @@ def make_job(
     project_root: Path,
 ) -> tuple[Path, dict[str, Any]]:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    job_id = f"{timestamp}_{slugify(item.name)}_{short_hash(item)}"
+    digest = source_digest(item)
+    job_id = f"{timestamp}_{slugify(item.name)}_{digest[:12]}"
     job_dir = paths["jobs"] / job_id
     counter = 2
     while job_dir.exists():
@@ -302,6 +304,7 @@ def make_job(
         "source_root": "source",
         "output_json": "output/questions.json",
         "output_assets": "output/assets",
+        "source_document_hash": digest,
         "sources": source_entries(source_root),
         "notes": [],
     }
@@ -402,8 +405,13 @@ def materialize_job(job_dir: Path, args: argparse.Namespace) -> tuple[bool, str]
         "--source-name",
         source_names(manifest),
     ]
+    source_hash = manifest.get("source_document_hash")
+    if source_hash:
+        proc_args.extend(["--source-hash", str(source_hash)])
     if assets_root.exists():
         proc_args.extend(["--assets-root", str(assets_root)])
+    if getattr(args, "approve_review", False):
+        proc_args.append("--approve-review")
 
     proc = run_cmd(proc_args, cwd=args.project_root)
     output = (proc.stdout + proc.stderr).strip()
@@ -466,6 +474,7 @@ def finalize(args: argparse.Namespace) -> int:
     paths = ensure_layout(args.imports_dir)
     successes = 0
     failures = 0
+    review_pending = 0
     for job_dir in iter_job_dirs(args.imports_dir):
         output_json = job_dir / "output/questions.json"
         if args.only_ready and not output_json.exists():
@@ -488,6 +497,20 @@ def finalize(args: argparse.Namespace) -> int:
             if message:
                 print(message)
         else:
+            if "human_review_needed=true" in message:
+                review_pending += 1
+                manifest = read_manifest(job_dir)
+                manifest.update(
+                    {
+                        "status": "needs_review",
+                        "review_requested_at": utc_now(),
+                        "review_message": message,
+                    }
+                )
+                write_manifest(job_dir, manifest)
+                print(f"needs review: {job_dir}", file=sys.stderr)
+                print(message, file=sys.stderr)
+                continue
             failures += 1
             manifest = read_manifest(job_dir)
             manifest.update({"status": "failed", "failed_at": utc_now(), "error": message})
@@ -497,7 +520,10 @@ def finalize(args: argparse.Namespace) -> int:
             print(f"failed: {destination}", file=sys.stderr)
             print(message, file=sys.stderr)
 
-    print(f"finalize summary: {successes} done, {failures} failed")
+    print(
+        f"finalize summary: {successes} done, "
+        f"{review_pending} needs review, {failures} failed"
+    )
     return 1 if failures else 0
 
 
@@ -524,12 +550,18 @@ def main() -> int:
     finalize_parser.add_argument("--move-failed", action="store_true", help="Move failed jobs to imports/failed.")
     finalize_parser.add_argument("--only-ready", action="store_true", help="Skip jobs that do not have output/questions.json.")
     finalize_parser.add_argument("--no-reindex", action="store_true", help="Do not rebuild the file-question index.")
+    finalize_parser.add_argument(
+        "--approve-review",
+        action="store_true",
+        help="Commit records marked human_review_needed after explicit human approval.",
+    )
 
     run_parser = subparsers.add_parser("run", help="Discover inbox items and finalize completed outputs.")
     run_parser.add_argument("--keep-jobs", action="store_true")
     run_parser.add_argument("--move-failed", action="store_true")
     run_parser.add_argument("--only-ready", action="store_true")
     run_parser.add_argument("--no-reindex", action="store_true")
+    run_parser.add_argument("--approve-review", action="store_true")
 
     args = parser.parse_args()
     args.project_root = args.project_root.resolve()

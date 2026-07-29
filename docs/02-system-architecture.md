@@ -7,9 +7,10 @@
   -> Next.js 前端
   -> FastAPI 后端
     -> questions/ 文件题库
-    -> questions/.index/vector-index.json
+    -> questions/.index/ FTS5、向量和动态知识点
+    -> uploads/ 文件任务与审核候选
     -> exports/file-papers/
-    -> SQLite/PostgreSQL 兼容层
+    -> SQLite 旧结构兼容层
 ```
 
 当前主路径：
@@ -29,9 +30,9 @@
 | 后端 | Python + FastAPI | 文件读取、索引、导出、OCR/LLM 扩展方便 |
 | 前端 | Next.js + TypeScript | 浏览器操作界面 |
 | 文件存储 | 本地 `questions/` | 当前题库真源 |
-| 索引 | 本地 JSON 向量索引 | 可重建，后续可换 pgvector/Qdrant |
+| 当前索引 | SQLite FTS5 + 本地 float32 向量 | 可选 embedding API，检索和融合由项目实现 |
 | PDF | XeLaTeX | 生成 TeX/PDF 试卷 |
-| 数据库 | SQLite/PostgreSQL | 兼容旧结构化流程、审核、历史记录 |
+| 数据库 | SQLite | 旧结构兼容层；不是题目正文真源 |
 
 ## 模块划分
 
@@ -61,7 +62,8 @@
 - 从题目文件重建索引。
 - 保存 `content_hash`。
 - 搜索题目正文、答案和元数据。
-- 后续接真实 embedding 模型或外部向量库。
+- 使用 FTS5、可选 embedding API、本地余弦检索和 RRF 融合。
+- embedding API 不可用时保留本地降级索引。
 
 ### 4. 组卷与导出服务
 
@@ -74,6 +76,7 @@
 - 写出 `questions.tex` 和 `answers.tex`。
 - 分别编译 `questions.pdf` 和 `answers.pdf`。
 - 提供题目卷、答案卷和各自编译日志的下载链接。
+- 输出含题目顺序、内容哈希、来源哈希、资产哈希和编译状态的 `manifest.json`。
 
 验收底线：不能只生成一个包含题目和答案的混合 PDF。答案必须进入独立答案卷。
 
@@ -82,9 +85,10 @@
 职责：
 
 - 上传原始 PDF、图片、Word、Markdown、LaTeX 等。
-- OCR/LLM 辅助切分题目。
-- 生成待审核的 `question.*`、`answer.*`、`assets/*`。
-- 保留原始文件和识别日志。
+- 当前可由解析器、视觉 API 或 Codex Skill 生成待审核候选。
+- 高风险候选必须经编辑、warning 确认和批准后才能进入正式题库。
+- 审核通过后使用 staging 和原子重命名提交正式题库。
+- 比赛下一阶段自行完成页级证据块、缓存、答案匹配和局部题图裁剪。
 
 ## 数据流
 
@@ -103,8 +107,10 @@ questions/{id}/assets/*
 ```text
 题目文件
   -> 提取标题、正文、答案、metadata
-  -> 生成向量/关键词索引
-  -> 写入 questions/.index/vector-index.json
+  -> SQLite FTS5/BM25
+  -> embedding API 或本地降级向量
+  -> vectors.f32 + vector-map.json + index-manifest.json
+  -> 动态 knowledge-points.json
 ```
 
 ### 组卷导出
@@ -136,10 +142,10 @@ questions/{id}/assets/*
 
 ## 后续扩展
 
-- 用 pgvector 或 Qdrant 替换本地 JSON 索引。
-- 增加 OCR 队列和任务状态。
-- 增加 LLM 导入助手。
+- 增加页级视觉 API 队列、缓存、任务恢复和调用量统计。
+- 增加来源区域对照、候选拆分合并和局部题图裁剪。
+- 增加动态知识点确认、删除和检索质量评测。
 - 增加模板管理。
 - 增加用户权限和操作日志。
 
-扩展时仍保持一条底线：题目正文和答案正文优先落在文件中，复杂结构只能作为可重建的视图或兼容层。
+比赛主链路不依赖完整第三方 OCR 平台、外部向量数据库或 Codex Agent。扩展时仍保持一条底线：题目正文和答案正文落在文件中，复杂结构只能作为可重建的视图或兼容层。

@@ -121,7 +121,11 @@ def create_job(*, use_llm_assist: bool, overwrite: bool) -> dict:
         "processed_files": 0,
         "current_file": None,
         "created_question_ids": [],
+        "candidate_ids": [],
+        "resolved_candidate_ids": [],
+        "rejected_candidate_ids": [],
         "imported_count": 0,
+        "review_count": 0,
         "errors": [],
         "warnings": [],
         "llm_used": False,
@@ -169,8 +173,6 @@ def add_source_file(
         "process": process,
         "status": "queued" if process else "asset",
     }
-    if process and source_type != "json":
-        entry["question_id_prefix"] = f"{job_id}_f{manifest['total_files'] + 1}"
     manifest.setdefault("source_files", []).append(entry)
     manifest["total_files"] = sum(1 for item in manifest["source_files"] if item.get("process"))
     return _write_job(manifest)
@@ -274,6 +276,8 @@ def _process_job(job_id: str) -> None:
     processed = int(manifest.get("processed_files") or 0)
     imported_count = int(manifest.get("imported_count") or 0)
     created_ids = list(manifest.get("created_question_ids") or [])
+    candidate_ids = list(manifest.get("candidate_ids") or [])
+    review_count = int(manifest.get("review_count") or 0)
     errors = list(manifest.get("errors") or [])
     warnings = list(manifest.get("warnings") or [])
     llm_used = bool(manifest.get("llm_used"))
@@ -299,7 +303,6 @@ def _process_job(job_id: str) -> None:
                     use_llm_assist=bool(manifest.get("use_llm_assist")),
                     overwrite=bool(manifest.get("overwrite")),
                     rebuild_after=False,
-                    question_id_prefix=item.get("question_id_prefix"),
                 )
             )
             llm_used = llm_used or result.llm_used
@@ -307,8 +310,17 @@ def _process_job(job_id: str) -> None:
                 if question.question_id not in created_ids:
                     created_ids.append(question.question_id)
                 imported_count += 1
+            for candidate in result.candidates:
+                candidate_id = str(candidate.get("candidate_id") or "")
+                if candidate_id and candidate_id not in candidate_ids:
+                    candidate_ids.append(candidate_id)
+                    review_count += 1
             warnings.extend(f"{filename}: {warning}" for warning in result.warnings)
-            _update_source_status(manifest, relative_path, "done")
+            _update_source_status(
+                manifest,
+                relative_path,
+                "needs_review" if result.candidates else "done",
+            )
         except Exception as exc:
             error = str(exc)
             errors.append({"filename": filename, "error": error})
@@ -320,6 +332,8 @@ def _process_job(job_id: str) -> None:
                 "processed_files": processed,
                 "imported_count": imported_count,
                 "created_question_ids": created_ids,
+                "candidate_ids": candidate_ids,
+                "review_count": review_count,
                 "errors": errors,
                 "warnings": warnings,
                 "llm_used": llm_used,
@@ -337,7 +351,9 @@ def _process_job(job_id: str) -> None:
     manifest["current_file"] = None
     manifest["finished_at"] = utc_now()
     manifest["errors"] = errors
-    if imported_count > 0 and errors:
+    if review_count > 0:
+        manifest["status"] = "needs_review"
+    elif imported_count > 0 and errors:
         manifest["status"] = "partial"
     elif imported_count > 0:
         manifest["status"] = "succeeded"
@@ -351,3 +367,41 @@ def source_type_or_error(filename: str) -> str:
     if not source_type:
         raise ValueError(f"Unsupported file type: {Path(filename).suffix or filename}")
     return source_type
+
+
+def record_candidate_resolution(
+    candidate_id: str,
+    *,
+    question_id: str | None = None,
+    rejected: bool = False,
+) -> None:
+    """Update any import job that owns a resolved review candidate."""
+    for manifest in list_jobs(limit=10_000):
+        candidate_ids = [str(item) for item in manifest.get("candidate_ids", []) if item]
+        if candidate_id not in candidate_ids:
+            continue
+
+        resolved = [str(item) for item in manifest.get("resolved_candidate_ids", []) if item]
+        rejected_ids = [str(item) for item in manifest.get("rejected_candidate_ids", []) if item]
+        if candidate_id not in resolved:
+            resolved.append(candidate_id)
+        if rejected and candidate_id not in rejected_ids:
+            rejected_ids.append(candidate_id)
+
+        created_ids = [str(item) for item in manifest.get("created_question_ids", []) if item]
+        if question_id and question_id not in created_ids:
+            created_ids.append(question_id)
+            manifest["imported_count"] = int(manifest.get("imported_count") or 0) + 1
+
+        pending = [item for item in candidate_ids if item not in resolved]
+        manifest["resolved_candidate_ids"] = resolved
+        manifest["rejected_candidate_ids"] = rejected_ids
+        manifest["created_question_ids"] = created_ids
+        manifest["review_count"] = len(pending)
+        if not pending and manifest.get("status") == "needs_review":
+            if manifest.get("errors") or rejected_ids:
+                manifest["status"] = "partial" if manifest.get("imported_count") else "failed"
+            else:
+                manifest["status"] = "succeeded"
+            manifest["finished_at"] = utc_now()
+        _write_job(manifest)

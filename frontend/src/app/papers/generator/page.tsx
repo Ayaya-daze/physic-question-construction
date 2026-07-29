@@ -198,6 +198,14 @@ function FilePaperGeneratorContent() {
               <p className="mt-1 text-sm text-green-800">
                 使用 {exportResult.question_count} 道题：{exportResult.question_ids.join(', ')}
               </p>
+              {(exportResult.question_compile_error_id || exportResult.answer_compile_error_id) && (
+                <p className="mt-2 text-sm text-amber-800">
+                  编译停止位置：
+                  {exportResult.question_compile_error_id && `题目卷 ${exportResult.question_compile_error_id}`}
+                  {exportResult.question_compile_error_id && exportResult.answer_compile_error_id && '；'}
+                  {exportResult.answer_compile_error_id && `答案卷 ${exportResult.answer_compile_error_id}`}
+                </p>
+              )}
 
               {/* Question paper downloads */}
               <div className="mt-3">
@@ -237,6 +245,12 @@ function FilePaperGeneratorContent() {
                     </a>
                   )}
                 </div>
+              </div>
+
+              <div className="mt-3">
+                <a href={exportResult.manifest_url} target="_blank" className="inline-flex items-center gap-1.5 rounded-lg bg-white px-3 py-2 text-sm font-medium text-gray-700 ring-1 ring-green-200 hover:bg-green-100">
+                  <FileText className="h-4 w-4" />manifest.json
+                </a>
               </div>
             </div>
           </div>

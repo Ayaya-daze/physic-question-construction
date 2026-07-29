@@ -56,7 +56,10 @@ POST /api/file-questions/papers/export
   "answer_tex_url": "/api/file-questions/papers/exports/.../answers.tex",
   "answer_pdf_url": "/api/file-questions/papers/exports/.../answers.pdf",
   "question_build_log_url": "/api/file-questions/papers/exports/.../build-questions.log",
-  "answer_build_log_url": "/api/file-questions/papers/exports/.../build-answers.log"
+  "answer_build_log_url": "/api/file-questions/papers/exports/.../build-answers.log",
+  "manifest_url": "/api/file-questions/papers/exports/.../manifest.json",
+  "question_compile_error_id": null,
+  "answer_compile_error_id": null
 }
 ```
 
@@ -70,6 +73,7 @@ backend/exports/file-papers/{export_id}/
   answers.pdf
   build-questions.log
   build-answers.log
+  manifest.json
   assets/
     {question_id}/
       diagram.png
@@ -83,11 +87,12 @@ backend/exports/file-papers/{export_id}/
 2. 读取每道题的 `answer.*`；没有答案时在答案卷对应题号下写“未提供答案”。
 3. Markdown/纯文本转换成简单 LaTeX。
 4. LaTeX 正文基本原样放入模板，只重写相对图片路径。
-5. 复制 `assets/` 到导出目录。
+5. 严格校验图片路径，只复制题目或答案正文实际引用的局部资产；缺图直接阻止导出。
 6. 用 `ctexart` 模板生成 `questions.tex`，内容只包含题目。
 7. 用 `ctexart` 模板生成 `answers.tex`，内容只包含答案。
 8. 调用 XeLaTeX 分别编译两个 PDF。
-9. 分别保存编译日志。
+9. 分别保存编译日志，并定位最可能失败的题目 ID。
+10. 写出题目顺序、内容哈希、来源哈希、资产哈希、模板版本和编译状态组成的 `manifest.json`。
 
 Markdown 图片：
 
@@ -128,6 +133,7 @@ Markdown 图片：
 - 答案 PDF 不混入完整题目正文，最多保留题号和必要引用。
 - 含图题的题目 PDF 中能看到题图；答案中引用图片时答案 PDF 也能看到对应图片。
 - 编译失败时仍保留对应 TeX 和日志。
+- 每次导出都包含可追溯的 `manifest.json`。
 
 ## 后续增强
 
@@ -135,7 +141,7 @@ Markdown 图片：
 
 - 更好的 Markdown 转 TeX。
 - 自定义模板。
-- 更强的语义搜索或外部向量库。
 - LLM 只做需求解析、候选解释和替换建议。
+- 题目候选命中原因、替换和拖动排序。
 
 不建议把题目核心重新拆成固定的题型、选项、答案类型、解析步骤。那些结构对生产题库的覆盖面太窄，应该作为兼容或可选导入视图，而不是主模型。

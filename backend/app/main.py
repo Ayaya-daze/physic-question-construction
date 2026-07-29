@@ -38,6 +38,13 @@ async def lifespan(app: FastAPI):
     await init_db()
 
     try:
+        from app.services.file_question_store import recover_interrupted_writes
+
+        recover_interrupted_writes()
+    except Exception:
+        pass
+
+    try:
         from app.services.file_import_jobs import recover_and_start_jobs
 
         recover_and_start_jobs()

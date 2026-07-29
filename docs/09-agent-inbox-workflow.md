@@ -9,11 +9,11 @@
 1. 扫描 inbox。
 2. 创建标准导入 job。
 3. 为每个 job 生成 `AGENT_TASK.md`。
-4. 对已经是结构化 JSON 的资料自动校验、入库、归档。
+4. 对已经是结构化 JSON 的资料自动校验；高风险记录停在审核状态。
 5. 对 PDF/扫描件交给 Codex agent + `physics-question-importer` skill 读页、拆题、写 JSON。
 6. 自动校验 skill 输出。
-7. 写入 `questions/{id}/question.md`、`answer.md`、`metadata.yaml`、`assets/*`。
-8. 重建 `questions/.index/vector-index.json`。
+7. 只有明确通过审核的记录才原子写入 `questions/{id}/question.md`、`answer.md`、`metadata.yaml`、`assets/*`。
+8. 重建 FTS5、向量和动态知识点索引。
 
 ## 目录结构
 
@@ -92,6 +92,12 @@ python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root .
 python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
 ```
 
+若输出标记需要人工审核，命令会把 job 状态设为 `needs_review`。对照来源确认完成后，显式批准：
+
+```bash
+python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize --approve-review
+```
+
 本项目也保留兼容包装：
 
 ```bash
@@ -124,7 +130,7 @@ imports/jobs/{job_id}/output/assets/*
 python3 skills/physics-question-importer/scripts/agent_inbox.py --project-root . finalize
 ```
 
-成功后 job 会进入 `imports/done/`，题目进入 `questions/`，索引自动重建。
+无风险输出可直接完成；包含 `human_review_needed: true` 的输出不会自动入库。批准后 job 才进入 `imports/done/`，题目进入 `questions/`，索引自动重建。
 
 ## 自动化边界
 

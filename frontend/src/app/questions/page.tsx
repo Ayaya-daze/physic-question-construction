@@ -2,6 +2,7 @@
 
 import { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
+import { useSearchParams } from 'next/navigation';
 import {
   AlertCircle,
   CheckCircle2,
@@ -94,6 +95,8 @@ function FileQuestionRow({ question }: { question: FileQuestionSummary }) {
 }
 
 function QuestionsPageContent() {
+  const searchParams = useSearchParams();
+  const knowledgePointId = searchParams.get('knowledge_point_id') || '';
   const [query, setQuery] = useState('');
   const [submittedQuery, setSubmittedQuery] = useState('');
   const [questions, setQuestions] = useState<FileQuestionSummary[]>([]);
@@ -111,6 +114,7 @@ function QuestionsPageContent() {
     try {
       const result = await getFileQuestions({
         q: submittedQuery.trim() || undefined,
+        knowledge_point_id: knowledgePointId || undefined,
         skip: (page - 1) * pageSize,
         limit: pageSize,
       });
@@ -123,7 +127,7 @@ function QuestionsPageContent() {
     } finally {
       setLoading(false);
     }
-  }, [page, submittedQuery]);
+  }, [knowledgePointId, page, submittedQuery]);
 
   useEffect(() => {
     loadQuestions();
@@ -142,6 +146,11 @@ function QuestionsPageContent() {
           <p className="mt-1 text-sm text-gray-500">
             共 {total} 道文件题目，当前页 {indexedCount} 道已索引
           </p>
+          {knowledgePointId && (
+            <p className="mt-1 font-mono text-xs text-blue-700">
+              知识点筛选：{knowledgePointId}
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap gap-2">
           <Link

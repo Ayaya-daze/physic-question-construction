@@ -2,6 +2,8 @@
 
 日期：2026-07-02
 
+> 本文是第一次交付前的历史整理快照，保留当时的路径和验收事实。当前项目边界见 [README.md](../README.md)，比赛目标见 [14-competition-project-plan.md](14-competition-project-plan.md)，执行顺序见 [07-implementation-plan.md](07-implementation-plan.md)。
+
 ## 结论
 
 当前项目应按文件题库交付，而不是按旧的硬编码题型数据库交付。
@@ -44,11 +46,11 @@ imports/inbox/ 或前端上传
 
 ## 目录口径
 
-应保留并视为项目有效数据：
+本地运行时应保留，但不得提交到 Git：
 
 - `questions/`：当前题库真源。
 - `imports/`：人类投放和 agent 导入队列。
-- 根目录 `第1套+.pdf`、`第1套+答案解析.pdf`、`第1套_人工校对文字版.txt`、`第2套+.pdf`、`第2套+答案解析.pdf`：当前测试源资料，未移动。
+- 根目录测试 PDF 和人工校对文本：仅作为本机验收资料，具体文件名不属于项目接口。
 
 可重建或运行时产物：
 
@@ -128,6 +130,6 @@ backend/exports/file-papers/filepaper_20260702_043155_7a5eeef4/
 
 - 扫描 PDF 的自动导入仍取决于 vision-capable agent 或人工校对；CnOcr/text-only LLM 不能恢复漏掉的题号、公式和图。
 - 文件题库已有样例题仍需要人审准确性。
-- 当前本地向量索引是轻量实现，生产大规模题库可替换为外部向量库，但索引仍应可从 `questions/` 重建。
+- 当前本地向量索引是轻量实现；比赛版计划使用 SQLite FTS5、真实 embedding 和项目内向量融合，索引仍应可从 `questions/` 重建。
 - 项目没有认证和权限控制，不应直接公网暴露。
 - 旧结构化页面仍在代码中，后续如果继续精简，可做一次兼容层隔离或归档。

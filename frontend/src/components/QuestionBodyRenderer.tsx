@@ -5,12 +5,15 @@ import katex from 'katex';
 type Format = 'markdown' | 'latex' | 'text';
 type RenderBlock = { kind: 'line'; value: string } | { kind: 'math'; value: string };
 
-function resolveAssetUrl(src: string, questionId: string): string {
+function resolveAssetUrl(src: string, questionId: string, assetBaseUrl?: string): string {
   const trimmed = src.trim();
   if (/^(https?:|data:|blob:|\/)/i.test(trimmed)) {
     return trimmed;
   }
   const filename = trimmed.split('/').pop() || trimmed;
+  if (assetBaseUrl) {
+    return `${assetBaseUrl.replace(/\/$/, '')}/${encodeURIComponent(filename)}`;
+  }
   return `/api/file-questions/${encodeURIComponent(questionId)}/assets/${encodeURIComponent(filename)}`;
 }
 
@@ -119,10 +122,12 @@ export default function QuestionBodyRenderer({
   body,
   format,
   questionId,
+  assetBaseUrl,
 }: {
   body: string;
   format: Format;
   questionId: string;
+  assetBaseUrl?: string;
 }) {
   if (!body.trim()) {
     return <p className="text-sm text-gray-400">未提供内容</p>;
@@ -142,7 +147,7 @@ export default function QuestionBodyRenderer({
           return (
             <figure key={idx} className="my-4">
               <img
-                src={resolveAssetUrl(image.src, questionId)}
+                src={resolveAssetUrl(image.src, questionId, assetBaseUrl)}
                 alt={image.alt}
                 className="mx-auto max-h-[360px] max-w-full rounded border border-gray-200 bg-white object-contain sm:max-w-[76%]"
               />

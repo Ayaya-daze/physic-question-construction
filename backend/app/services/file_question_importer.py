@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import base64
+import hashlib
 import re
 import zipfile
 from dataclasses import dataclass, field
@@ -27,11 +28,13 @@ from app.config import settings
 from app.services.file_question_store import (
     FileQuestion,
     question_dir,
+    read_question,
     rebuild_index,
     validate_asset_payload,
     validate_question_id,
     write_question,
 )
+from app.services.file_question_candidates import create_candidate
 from app.services.llm import LLMNotConfiguredError, get_llm_provider
 from app.services.parsers import ParsedDocument, get_parser
 
@@ -71,6 +74,7 @@ class SourceAsset:
 @dataclass
 class ImportResult:
     questions: list[FileQuestion] = field(default_factory=list)
+    candidates: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     llm_used: bool = False
 
@@ -126,18 +130,63 @@ def _metadata(
     original_filename: str,
     source_type: str,
     import_method: str,
+    source_document_hash: str,
     extra: dict | None = None,
 ) -> dict:
     payload = {
         "title": _title_from_filename(original_filename),
         "source_filename": original_filename,
         "source_type": source_type,
+        "source_document_hash": source_document_hash,
         "import_method": import_method,
         "imported_at": datetime.now(timezone.utc).isoformat(),
     }
     if extra:
         payload.update({k: v for k, v in extra.items() if v not in (None, "", [])})
     return payload
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stable_question_id(
+    *,
+    source_document_hash: str,
+    original_filename: str,
+    item: dict[str, Any] | None,
+    item_index: int,
+) -> str:
+    explicit = item.get("question_id") if item else None
+    if isinstance(explicit, str) and explicit.strip():
+        return validate_question_id(explicit)
+
+    metadata = item.get("metadata") if item and isinstance(item.get("metadata"), dict) else {}
+    logical_key = next(
+        (
+            str(metadata[key]).strip()
+            for key in ("original_problem_number", "question_number", "problem_number")
+            if metadata.get(key) not in (None, "")
+        ),
+        "",
+    )
+    if not logical_key:
+        pages = metadata.get("source_pages")
+        page_key = ",".join(str(page) for page in pages) if isinstance(pages, list) else ""
+        title = str(metadata.get("title") or "").strip()
+        logical_key = (
+            f"item-{item_index}|{page_key}|{title}"
+            if page_key or title
+            else f"item-{item_index}"
+        )
+    digest = hashlib.sha256(
+        f"{source_document_hash}\0{Path(original_filename).name}\0{logical_key}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"qf_{digest}"
 
 
 def _page_markdown(page_number: int, text: str, image_filename: str | None) -> str:
@@ -296,7 +345,6 @@ def _structured_json_assets(item: dict, source_path: Path) -> list[SourceAsset]:
 def _preflight_structured_json_items(
     items: list[dict],
     source_path: Path,
-    overwrite: bool,
 ) -> dict[int, list[SourceAsset]]:
     """Validate structured JSON before writing any question directories."""
     seen_ids: set[str] = set()
@@ -309,8 +357,6 @@ def _preflight_structured_json_items(
             if qid in seen_ids:
                 raise ValueError(f"Duplicate question_id in structured JSON: {qid}")
             seen_ids.add(qid)
-            if question_dir(qid).exists() and not overwrite:
-                raise FileExistsError(qid)
         assets_by_index[index] = _structured_json_assets(item, source_path)
 
     return assets_by_index
@@ -706,6 +752,7 @@ def _write_single_question(
     answer_body: str,
     original_filename: str,
     source_type: str,
+    source_document_hash: str,
     import_method: str,
     body_format: str,
     assets: list[SourceAsset],
@@ -716,9 +763,14 @@ def _write_single_question(
     metadata = _metadata(
         original_filename=original_filename,
         source_type=source_type,
+        source_document_hash=source_document_hash,
         import_method=import_method,
         extra=metadata_extra,
     )
+    if question_id and question_dir(question_id).exists():
+        existing = read_question(question_id)
+        if existing.metadata.get("source_document_hash") == source_document_hash:
+            metadata["imported_at"] = existing.metadata.get("imported_at", metadata["imported_at"])
     return write_question(
         question_id=question_id,
         question_body=question_body,
@@ -728,7 +780,86 @@ def _write_single_question(
         metadata=metadata,
         assets=[(asset.filename, asset.payload) for asset in assets],
         overwrite=overwrite,
+        idempotent=not overwrite,
     )
+
+
+def _queue_candidate(
+    *,
+    question_body: str,
+    answer_body: str,
+    original_filename: str,
+    source_type: str,
+    source_document_hash: str,
+    import_method: str,
+    body_format: str,
+    assets: list[SourceAsset],
+    question_id: str,
+    metadata_extra: dict | None,
+    warnings: list[str],
+) -> dict[str, Any]:
+    metadata = _metadata(
+        original_filename=original_filename,
+        source_type=source_type,
+        source_document_hash=source_document_hash,
+        import_method=import_method,
+        extra=metadata_extra,
+    )
+    metadata["human_review_needed"] = True
+    return create_candidate(
+        question_body=question_body,
+        answer_body=answer_body,
+        question_format=body_format,
+        answer_format="markdown",
+        metadata=metadata,
+        assets=[(asset.filename, asset.payload) for asset in assets],
+        proposed_question_id=question_id,
+        source_filename=original_filename,
+        source_type=source_type,
+        source_document_hash=source_document_hash,
+        warnings=warnings,
+    )
+
+
+def _collect_candidate_result(
+    candidate: dict[str, Any],
+    *,
+    questions: list[FileQuestion],
+    candidates: list[dict[str, Any]],
+    warnings: list[str],
+) -> None:
+    """Classify a deterministic reimport using its persisted review state."""
+    state = str(candidate.get("state") or "")
+    if state == "needs_review":
+        candidates.append(candidate)
+        return
+    if state == "committed":
+        committed_question_id = str(candidate.get("committed_question_id") or "")
+        if not committed_question_id:
+            raise ValueError("Committed candidate is missing committed_question_id")
+        questions.append(read_question(committed_question_id))
+        return
+    if state == "rejected":
+        warnings.append(
+            "A matching candidate was previously rejected and was not queued again: "
+            + str(candidate.get("candidate_id") or "")
+        )
+        return
+    raise ValueError(f"Unsupported candidate state: {state or '(empty)'}")
+
+
+def _requires_review(
+    *,
+    source_type: str,
+    import_method: str,
+    metadata: dict[str, Any],
+    warnings: list[str],
+) -> bool:
+    if bool(metadata.get("human_review_needed")) or warnings:
+        return True
+    if import_method == "llm_assisted":
+        return True
+    return source_type in {"pdf", "image", "docx"}
 
 
 async def import_source_file(
@@ -738,11 +869,11 @@ async def import_source_file(
     use_llm_assist: bool = False,
     overwrite: bool = False,
     rebuild_after: bool = True,
-    question_id_prefix: str | None = None,
 ) -> ImportResult:
     source_type = source_type_from_filename(original_filename)
     if not source_type:
         raise ValueError(f"Unsupported file type: {Path(original_filename).suffix or original_filename}")
+    source_document_hash = _file_sha256(source_path)
 
     _load_parser_modules()
     warnings: list[str] = []
@@ -827,24 +958,27 @@ async def import_source_file(
             warnings.append("LLM returned no usable question records.")
 
     questions: list[FileQuestion] = []
+    candidates: list[dict[str, Any]] = []
     if llm_items:
         structured_assets_by_index = (
-            _preflight_structured_json_items(llm_items, source_path, overwrite)
+            _preflight_structured_json_items(llm_items, source_path)
             if source_type == "json"
             else {}
         )
         for item_index, item in enumerate(llm_items):
-            generated_question_id = None
-            if source_type == "json":
-                generated_question_id = item.get("question_id")
-            elif question_id_prefix:
-                generated_question_id = f"{validate_question_id(question_id_prefix)}_q{item_index + 1}"
+            generated_question_id = _stable_question_id(
+                source_document_hash=source_document_hash,
+                original_filename=original_filename,
+                item=item,
+                item_index=item_index + 1,
+            )
             item_assets = (
                 structured_assets_by_index[item_index]
                 if source_type == "json"
                 else _assets_for_llm_item(item, assets)
             )
             item_metadata = dict(item.get("metadata") or {})
+            item_warnings: list[str] = []
             # Post-process LLM output to ensure formulas have $...$ delimiters
             q_body = _ensure_math_delimiters(item["question_body"])
             a_body = _ensure_math_delimiters(item.get("answer_body", ""))
@@ -852,30 +986,60 @@ async def import_source_file(
             a_body, removed_answer_pages = _strip_rendered_page_image_refs(a_body)
             removed_page_refs = sorted(set(removed_question_pages + removed_answer_pages))
             if removed_page_refs:
-                warnings.append(
+                removed_warning = (
                     "Removed rendered PDF page image references from LLM output: "
                     + ", ".join(removed_page_refs)
                 )
+                warnings.append(removed_warning)
+                item_warnings.append(removed_warning)
                 item_metadata["human_review_needed"] = True
                 item_metadata["asset_review_note"] = (
                     "LLM referenced whole-page PDF renders. These were not imported as question assets; "
                     "crop the actual figure region into assets/ if the problem needs an image."
                 )
             item_body = _append_asset_refs(q_body, item_assets)
-            questions.append(
-                _write_single_question(
+            import_method = "structured_json" if source_type == "json" else "llm_assisted"
+            if _requires_review(
+                source_type=source_type,
+                import_method=import_method,
+                metadata=item_metadata,
+                warnings=item_warnings,
+            ):
+                candidate = _queue_candidate(
                     question_body=item_body,
                     answer_body=a_body,
                     original_filename=original_filename,
                     source_type=source_type,
-                    import_method="structured_json" if source_type == "json" else "llm_assisted",
+                    source_document_hash=source_document_hash,
+                    import_method=import_method,
                     body_format="markdown",
                     assets=item_assets,
                     question_id=generated_question_id,
                     metadata_extra=item_metadata,
-                    overwrite=overwrite,
+                    warnings=item_warnings,
                 )
-            )
+                _collect_candidate_result(
+                    candidate,
+                    questions=questions,
+                    candidates=candidates,
+                    warnings=warnings,
+                )
+            else:
+                questions.append(
+                    _write_single_question(
+                        question_body=item_body,
+                        answer_body=a_body,
+                        original_filename=original_filename,
+                        source_type=source_type,
+                        source_document_hash=source_document_hash,
+                        import_method=import_method,
+                        body_format="markdown",
+                        assets=item_assets,
+                        question_id=generated_question_id,
+                        metadata_extra=item_metadata,
+                        overwrite=overwrite,
+                    )
+                )
     else:
         if page_assets and not body.strip():
             raise ValueError(
@@ -887,21 +1051,59 @@ async def import_source_file(
             metadata_extra["page_count"] = len(parsed.pages)
             if parsed.metadata.get("title"):
                 metadata_extra["title"] = parsed.metadata.get("title")
-        questions.append(
-            _write_single_question(
+        generated_question_id = _stable_question_id(
+            source_document_hash=source_document_hash,
+            original_filename=original_filename,
+            item={"metadata": metadata_extra},
+            item_index=1,
+        )
+        if _requires_review(
+            source_type=source_type,
+            import_method="direct",
+            metadata=metadata_extra,
+            warnings=warnings,
+        ):
+            candidate = _queue_candidate(
                 question_body=body,
                 answer_body="",
                 original_filename=original_filename,
                 source_type=source_type,
+                source_document_hash=source_document_hash,
                 import_method="direct",
                 body_format=body_format,
                 assets=assets,
-                question_id=question_id_prefix,
+                question_id=generated_question_id,
                 metadata_extra=metadata_extra,
-                overwrite=overwrite,
+                warnings=warnings,
             )
-        )
+            _collect_candidate_result(
+                candidate,
+                questions=questions,
+                candidates=candidates,
+                warnings=warnings,
+            )
+        else:
+            questions.append(
+                _write_single_question(
+                    question_body=body,
+                    answer_body="",
+                    original_filename=original_filename,
+                    source_type=source_type,
+                    source_document_hash=source_document_hash,
+                    import_method="direct",
+                    body_format=body_format,
+                    assets=assets,
+                    question_id=generated_question_id,
+                    metadata_extra=metadata_extra,
+                    overwrite=overwrite,
+                )
+            )
 
-    if rebuild_after:
+    if rebuild_after and questions:
         rebuild_index()
-    return ImportResult(questions=questions, warnings=warnings, llm_used=bool(llm_items) and source_type != "json")
+    return ImportResult(
+        questions=questions,
+        candidates=candidates,
+        warnings=warnings,
+        llm_used=bool(llm_items) and source_type != "json",
+    )

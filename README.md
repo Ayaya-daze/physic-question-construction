@@ -101,10 +101,21 @@ backend/exports/file-papers/{export_id}/
 
 ### 本地开发
 
+**Windows（PowerShell）** 下虚拟环境脚本位于 `venv\Scripts\`：
+
+```powershell
+cd backend
+venv\Scripts\uvicorn.exe app.main:app --host 127.0.0.1 --port 8000
+```
+
+**Linux / macOS** 使用：
+
 ```bash
 cd backend
 venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+前端两种平台一致：
 
 ```bash
 cd frontend

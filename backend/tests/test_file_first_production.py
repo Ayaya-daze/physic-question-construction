@@ -132,6 +132,15 @@ class IsolatedFileStoreTest(unittest.TestCase):
 
     def test_question_and_asset_symlinks_are_rejected(self) -> None:
         store.ensure_store()
+        # Creating symlinks requires administrator privileges or Developer Mode
+        # on Windows; skip the safety check when the platform forbids them
+        # (the test's logic needs a real symlink to exercise).
+        try:
+            probe = self.questions_dir / "symlink_probe"
+            probe.symlink_to(self.root, target_is_directory=True)
+            probe.unlink()
+        except OSError:
+            self.skipTest("Symbolic links are not permitted on this system")
         external = self.root / "external"
         external.mkdir()
         (external / "question.md").write_text("External question.", encoding="utf-8")

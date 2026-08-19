@@ -5,6 +5,8 @@ RUN apt-get update \
         gcc \
         libpq-dev \
         poppler-utils \
+        tesseract-ocr \
+        tesseract-ocr-chi-sim \
         texlive-xetex \
         texlive-latex-recommended \
         texlive-latex-extra \
@@ -12,7 +14,7 @@ RUN apt-get update \
         fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --retries 5 --timeout 120 -r requirements.txt
 COPY . .
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

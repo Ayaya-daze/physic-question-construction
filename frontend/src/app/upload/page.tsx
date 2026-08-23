@@ -312,14 +312,11 @@ export default function UploadPage() {
     let cancelled = false;
 
     async function restoreJob() {
+      let savedJob: FileImportJob | null = null;
       try {
         const savedJobId = window.localStorage.getItem(lastJobStorageKey);
         if (savedJobId) {
-          const savedJob = await getFileImportJob(savedJobId);
-          if (!cancelled) {
-            setJob(savedJob);
-            return;
-          }
+          savedJob = await getFileImportJob(savedJobId);
         }
       } catch {
         window.localStorage.removeItem(lastJobStorageKey);
@@ -328,12 +325,13 @@ export default function UploadPage() {
       try {
         const recentJobs = await listFileImportJobs(10);
         const activeJob = recentJobs.find((item) => activeStatuses.has(item.status));
-        if (!cancelled && activeJob) {
-          setJob(activeJob);
-          window.localStorage.setItem(lastJobStorageKey, activeJob.job_id);
+        const restoredJob = activeJob || recentJobs[0] || savedJob;
+        if (!cancelled && restoredJob) {
+          setJob(restoredJob);
+          window.localStorage.setItem(lastJobStorageKey, restoredJob.job_id);
         }
       } catch {
-        // No job history available; the upload form still works.
+        if (!cancelled && savedJob) setJob(savedJob);
       }
     }
 

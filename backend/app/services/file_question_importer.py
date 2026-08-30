@@ -60,6 +60,7 @@ EXT_TO_SOURCE_TYPE = {
 
 SUPPORTED_EXTENSIONS = set(EXT_TO_SOURCE_TYPE.keys())
 MAX_LLM_SOURCE_CHARS = 24_000
+VISION_PAGE_BATCH_SIZE = 2
 
 
 @dataclass
@@ -468,21 +469,41 @@ def _normalize_llm_items(raw_items: Any) -> list[dict]:
 
 
 def _parse_llm_json(content: str) -> list[dict]:
-    # Try markdown code fence first
-    match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", content, re.DOTALL)
-    if match:
-        try:
-            return _normalize_llm_items(json.loads(match.group(1)))
-        except json.JSONDecodeError:
-            return []
+    def decode(candidate: str) -> Any:
+        # Start with strict JSON, then tolerate two common model-output defects:
+        # unnecessary apostrophe escapes and literal newlines inside strings.
+        variants = (candidate, candidate.replace("\\'", "'"))
+        for strict in (True, False):
+            for variant in dict.fromkeys(variants):
+                try:
+                    return json.loads(variant, strict=strict)
+                except json.JSONDecodeError:
+                    continue
+        return None
 
-    # Try bare JSON array
-    match = re.search(r"\[.*\]", content, re.DOTALL)
-    if match:
-        try:
-            return _normalize_llm_items(json.loads(match.group(0)))
-        except json.JSONDecodeError:
-            pass
+    # Parse the entire fenced payload. Matching the array itself with a
+    # non-greedy regex truncates valid JSON at nested arrays such as
+    # knowledge_points or source_pages.
+    fenced_blocks = re.findall(r"```(?:json)?\s*(.*?)\s*```", content, re.DOTALL | re.IGNORECASE)
+    for block in fenced_blocks:
+        raw_items = decode(block.strip())
+        if raw_items is not None:
+            return _normalize_llm_items(raw_items)
+
+    # For an unfenced response, find the first array and let JSONDecoder locate
+    # its real closing bracket, including nested arrays and brackets in strings.
+    for match in re.finditer(r"\[", content):
+        candidate = content[match.start():]
+        variants = (candidate, candidate.replace("\\'", "'"))
+        for strict in (True, False):
+            decoder = json.JSONDecoder(strict=strict)
+            for variant in dict.fromkeys(variants):
+                try:
+                    raw_items, _ = decoder.raw_decode(variant)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(raw_items, list):
+                    return _normalize_llm_items(raw_items)
 
     # Not JSON at all — LLM refused or replied with text
     return []
@@ -581,23 +602,34 @@ async def _vision_split_into_file_questions(
         return []
 
     paper_metadata = _paper_metadata_from_text(original_filename, ocr_page_texts)
-    ocr_hint_text = "\n\n".join(
-        f"## Page {page_num} OCR hint\n{text}"
-        for text, page_num, _ in ocr_page_texts
-    )
-    if len(ocr_hint_text) > MAX_LLM_SOURCE_CHARS:
-        ocr_hint_text = ocr_hint_text[:MAX_LLM_SOURCE_CHARS] + "\n[OCR hint truncated]"
 
-    page_list = ", ".join(f"{asset.page_number}:{asset.filename}" for asset in sorted_assets)
-    prompt = f"""Import this scanned physics paper into simple question files.
+    async def import_page_batch(batch_assets: list[SourceAsset]) -> list[dict]:
+        batch_pages = [asset.page_number or 1 for asset in batch_assets]
+        batch_page_set = set(batch_pages)
+        batch_hints = [
+            hint for hint in ocr_page_texts
+            if hint[1] in batch_page_set
+        ]
+        ocr_hint_text = "\n\n".join(
+            f"## Page {page_num} OCR hint\n{text}"
+            for text, page_num, _ in batch_hints
+        )
+        if len(ocr_hint_text) > MAX_LLM_SOURCE_CHARS:
+            ocr_hint_text = ocr_hint_text[:MAX_LLM_SOURCE_CHARS] + "\n[OCR hint truncated]"
+
+        page_list = ", ".join(
+            f"{asset.page_number}:{asset.filename}" for asset in batch_assets
+        )
+        prompt = f"""Import this page batch from a scanned physics paper into simple question files.
 
 Source: {original_filename}
 Hints: title={paper_metadata.get("title")}; total_problems={paper_metadata.get("total_problems")}; total_score={paper_metadata.get("total_score")}; OCR_numbers={paper_metadata.get("possible_problem_numbers")}; pages={page_list}
 
 Rules:
 - Page images are authoritative; OCR is only a hint.
+- Only pages listed above are available in this batch. Never invent content from other pages.
 - Split only visible major problems like 1. / 2. / 7.(40分). Keep subparts (1)(2)(3), ①②③ inside the parent problem.
-- Merge cross-page continuations. Do not force the output count to match hints.
+- Merge continuations across the supplied pages. If a visible problem is incomplete because it continues outside this batch, keep the visible text and set human_review_needed=true.
 - Recover visible problem numbers missed by OCR; ignore isolated OCR number noise with no problem body.
 - Write Markdown with LaTeX math delimiters $...$ or $$...$$.
 - Fill answer_body only for explicit source answers; never solve.
@@ -610,16 +642,114 @@ Return ONLY a JSON array:
 OCR hints:
 {ocr_hint_text or "[no OCR hints available]"}"""
 
-    response = await provider.complete_with_images(
-        image_data=[_asset_data_uri(asset) for asset in sorted_assets],
-        prompt=prompt,
-        system_prompt=(
-            "Vision-first physics question importer. Page images are authoritative. Return strict JSON only."
-        ),
-        max_tokens=settings.LLM_MAX_TOKENS,
-        temperature=0.0,
-    )
-    return _parse_llm_json(response.content)
+        response = await provider.complete_with_images(
+            image_data=[_asset_data_uri(asset) for asset in batch_assets],
+            prompt=prompt,
+            system_prompt=(
+                "Vision-first physics question importer. Page images are authoritative. Return strict JSON only."
+            ),
+            max_tokens=settings.LLM_MAX_TOKENS,
+            temperature=0.0,
+        )
+        items = _parse_llm_json(response.content)
+        for item in items:
+            if item.get("source_pages"):
+                continue
+            item["source_pages"] = list(batch_pages)
+            metadata = dict(item.get("metadata") or {})
+            metadata["source_pages"] = list(batch_pages)
+            item["metadata"] = metadata
+        return items
+
+    async def import_single_page_as_markdown(asset: SourceAsset) -> dict | None:
+        page_number = asset.page_number or 1
+        page_hints = [text for text, page, _ in ocr_page_texts if page == page_number]
+        ocr_hint = "\n\n".join(page_hints)[:MAX_LLM_SOURCE_CHARS]
+        prompt = f"""Transcribe the visible physics question content on this scanned page as Markdown.
+
+Source: {original_filename}; page: {page_number}
+
+Rules:
+- Preserve every visible major problem number, subpart, symbol, formula, and condition in reading order.
+- Use $...$ or $$...$$ for LaTeX math.
+- Do not solve, summarize, or invent missing content.
+- For an uncropped figure, write [图见原 PDF 第 {page_number} 页，需人工裁剪].
+- Return Markdown text only, without JSON or a code fence.
+
+OCR hint (may be inaccurate):
+{ocr_hint or "[no OCR hint available]"}"""
+        response = await provider.complete_with_images(
+            image_data=[_asset_data_uri(asset)],
+            prompt=prompt,
+            system_prompt=(
+                "Physics page transcriber. The image is authoritative. Return Markdown only."
+            ),
+            max_tokens=settings.LLM_MAX_TOKENS,
+            temperature=0.0,
+        )
+        body = (response.content or "").strip()
+        fenced = re.fullmatch(
+            r"```(?:markdown|md)?\s*(.*?)\s*```",
+            body,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if fenced:
+            body = fenced.group(1).strip()
+        if len(body) < 10:
+            return None
+        return {
+            "question_id": None,
+            "question_body": body,
+            "answer_body": "",
+            "metadata": {
+                "title": paper_metadata.get("title"),
+                "knowledge_points": [],
+                "source_pages": [page_number],
+                "human_review_needed": True,
+                "vision_fallback": "page_markdown_transcription",
+            },
+            "source_pages": [page_number],
+        }
+
+    async def recover_single_page(asset: SourceAsset) -> list[dict]:
+        page_items = await import_page_batch([asset])
+        if page_items:
+            return page_items
+        markdown_item = await import_single_page_as_markdown(asset)
+        return [markdown_item] if markdown_item else []
+
+    all_items: list[dict] = []
+    failed_pages: list[int] = []
+    for offset in range(0, len(sorted_assets), VISION_PAGE_BATCH_SIZE):
+        batch = sorted_assets[offset:offset + VISION_PAGE_BATCH_SIZE]
+        batch_items = await import_page_batch(batch)
+        if batch_items:
+            all_items.extend(batch_items)
+            continue
+
+        # A two-page response may still be truncated or malformed. Retrying
+        # page-by-page keeps one bad batch from discarding the whole document.
+        if len(batch) > 1:
+            for asset in batch:
+                page_items = await recover_single_page(asset)
+                if page_items:
+                    all_items.extend(page_items)
+                else:
+                    failed_pages.append(asset.page_number or 1)
+        else:
+            page_items = await import_single_page_as_markdown(batch[0])
+            if page_items:
+                all_items.append(page_items)
+            else:
+                failed_pages.append(batch[0].page_number or 1)
+
+    if failed_pages:
+        page_text = ", ".join(str(page) for page in failed_pages)
+        raise ValueError(
+            f"Vision model returned no usable question records for PDF page(s): {page_text}. "
+            "Other page batches were not imported so the document can be retried safely."
+        )
+    return all_items
 
 
 async def _llm_split_into_file_questions(source_text: str, original_filename: str) -> list[dict]:
@@ -854,11 +984,12 @@ def _requires_review(
     import_method: str,
     metadata: dict[str, Any],
     warnings: list[str],
+    skip_llm_review: bool = False,
 ) -> bool:
     if bool(metadata.get("human_review_needed")) or warnings:
         return True
     if import_method == "llm_assisted":
-        return True
+        return not skip_llm_review
     return source_type in {"pdf", "image", "docx"}
 
 
@@ -959,6 +1090,9 @@ async def import_source_file(
 
     questions: list[FileQuestion] = []
     candidates: list[dict[str, Any]] = []
+    multi_page_vision_import = bool(
+        use_llm_assist and page_assets and len(page_assets) > 1
+    )
     if llm_items:
         structured_assets_by_index = (
             _preflight_structured_json_items(llm_items, source_path)
@@ -1004,6 +1138,7 @@ async def import_source_file(
                 import_method=import_method,
                 metadata=item_metadata,
                 warnings=item_warnings,
+                skip_llm_review=multi_page_vision_import,
             ):
                 candidate = _queue_candidate(
                     question_body=item_body,

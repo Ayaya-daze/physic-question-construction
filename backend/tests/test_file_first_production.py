@@ -16,6 +16,7 @@ from PIL import Image
 
 from app.api import file_questions as file_api
 from app.config import settings
+from app.services import file_question_importer as importer
 from app.services import file_question_store as store
 from app.services.file_question_candidates import (
     approve_candidate,
@@ -27,7 +28,7 @@ from app.services.file_knowledge_points import (
     merge_knowledge_points,
     rename_knowledge_point,
 )
-from app.services.file_question_importer import import_source_file
+from app.services.file_question_importer import _parse_llm_json, import_source_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -296,6 +297,224 @@ class IsolatedFileStoreTest(unittest.TestCase):
         self.assertEqual(result.questions, [])
         self.assertEqual(len(result.candidates), 1)
         self.assertFalse(any(self.questions_dir.glob("qf_*")))
+
+    def test_llm_json_parser_accepts_nested_arrays_in_fenced_json(self) -> None:
+        content = r"""```json
+[
+  {
+    "question_body": "A diagram on line $OO\'$ is marked [see source page].
+Find $v$.",
+    "answer_body": "",
+    "metadata": {
+      "knowledge_points": ["kinematics", "energy"],
+      "source_pages": [1],
+      "human_review_needed": true
+    }
+  }
+]
+```"""
+
+        items = _parse_llm_json(content)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["metadata"]["source_pages"], [1])
+        self.assertEqual(items[0]["metadata"]["knowledge_points"], ["kinematics", "energy"])
+
+    def test_vision_import_batches_multi_page_documents(self) -> None:
+        class FakeVisionProvider:
+            supports_vision = True
+
+            def __init__(self) -> None:
+                self.batch_sizes: list[int] = []
+
+            async def complete_with_images(self, *, image_data: list[str], **kwargs):
+                self.batch_sizes.append(len(image_data))
+                index = len(self.batch_sizes)
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "content": json.dumps(
+                            [
+                                {
+                                    "question_body": f"Question from page batch {index}.",
+                                    "answer_body": "",
+                                    "metadata": {"knowledge_points": []},
+                                }
+                            ]
+                        )
+                    },
+                )()
+
+        provider = FakeVisionProvider()
+        assets = [
+            importer.SourceAsset(
+                filename=f"page_{page:03d}.png",
+                payload=png_bytes(),
+                page_number=page,
+            )
+            for page in range(1, 6)
+        ]
+        config = {
+            "enabled": True,
+            "configured": True,
+            "supports_vision": True,
+        }
+
+        with (
+            patch.object(importer, "llm_import_config", return_value=config),
+            patch.object(importer, "get_llm_provider", return_value=provider),
+        ):
+            items = asyncio.run(
+                importer._vision_split_into_file_questions(
+                    page_assets=assets,
+                    ocr_page_texts=[],
+                    original_filename="paper.pdf",
+                )
+            )
+
+        self.assertEqual(provider.batch_sizes, [2, 2, 1])
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0]["source_pages"], [1, 2])
+        self.assertEqual(items[1]["source_pages"], [3, 4])
+        self.assertEqual(items[2]["source_pages"], [5])
+
+    def test_vision_import_falls_back_to_markdown_for_invalid_page_json(self) -> None:
+        class FakeVisionProvider:
+            supports_vision = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def complete_with_images(self, *, prompt: str, **kwargs):
+                self.calls += 1
+                content = (
+                    "1. A sufficiently long transcribed physics question with $F=ma$."
+                    if prompt.startswith("Transcribe")
+                    else "not valid JSON"
+                )
+                return type("Response", (), {"content": content})()
+
+        provider = FakeVisionProvider()
+        asset = importer.SourceAsset(
+            filename="page_001.png",
+            payload=png_bytes(),
+            page_number=1,
+        )
+        config = {
+            "enabled": True,
+            "configured": True,
+            "supports_vision": True,
+        }
+
+        with (
+            patch.object(importer, "llm_import_config", return_value=config),
+            patch.object(importer, "get_llm_provider", return_value=provider),
+        ):
+            items = asyncio.run(
+                importer._vision_split_into_file_questions(
+                    page_assets=[asset],
+                    ocr_page_texts=[],
+                    original_filename="paper.pdf",
+                )
+            )
+
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(len(items), 1)
+        self.assertTrue(items[0]["metadata"]["human_review_needed"])
+        self.assertEqual(
+            items[0]["metadata"]["vision_fallback"],
+            "page_markdown_transcription",
+        )
+
+    def test_multi_page_vision_import_only_skips_blanket_llm_review(self) -> None:
+        self.assertTrue(
+            importer._requires_review(
+                source_type="pdf",
+                import_method="llm_assisted",
+                metadata={"human_review_needed": True},
+                warnings=["figure needs cropping"],
+                skip_llm_review=True,
+            )
+        )
+        self.assertFalse(
+            importer._requires_review(
+                source_type="pdf",
+                import_method="llm_assisted",
+                metadata={"human_review_needed": False},
+                warnings=[],
+                skip_llm_review=True,
+            )
+        )
+        self.assertTrue(
+            importer._requires_review(
+                source_type="pdf",
+                import_method="llm_assisted",
+                metadata={"human_review_needed": True},
+                warnings=[],
+            )
+        )
+
+    def test_multi_page_vision_import_routes_each_question_independently(self) -> None:
+        source = self.root / "multi-page.pdf"
+        source.write_bytes(b"fake pdf")
+        page_assets = [
+            importer.SourceAsset(
+                filename=f"page_{page:03d}.png",
+                payload=png_bytes(),
+                page_number=page,
+            )
+            for page in (1, 2)
+        ]
+        llm_items = [
+            {
+                "question_body": "1. A complete text-only physics question.",
+                "answer_body": "",
+                "metadata": {
+                    "source_pages": [1],
+                    "human_review_needed": False,
+                },
+                "source_pages": [1],
+            },
+            {
+                "question_body": "2. A question whose required figure needs manual cropping.",
+                "answer_body": "",
+                "metadata": {
+                    "source_pages": [2],
+                    "human_review_needed": True,
+                },
+                "source_pages": [2],
+            },
+        ]
+
+        with (
+            patch.object(importer, "_load_parser_modules"),
+            patch.object(
+                importer,
+                "get_parser",
+                return_value=lambda path: importer.ParsedDocument(raw_text=""),
+            ),
+            patch.object(importer, "_render_pdf_page_assets", return_value=page_assets),
+            patch.object(importer, "_ocr_page_hints", return_value=[]),
+            patch.object(
+                importer,
+                "_vision_split_into_file_questions",
+                return_value=llm_items,
+            ),
+        ):
+            result = asyncio.run(
+                import_source_file(
+                    source_path=source,
+                    original_filename="multi-page.pdf",
+                    use_llm_assist=True,
+                    rebuild_after=False,
+                )
+            )
+
+        self.assertEqual(len(result.questions), 1)
+        self.assertEqual(len(result.candidates), 1)
+        self.assertIn("complete text-only", result.questions[0].question_body)
+        self.assertIn("required figure", result.candidates[0]["question_body"])
 
     def test_candidate_reimport_reuses_committed_review(self) -> None:
         source = self.root / "review.json"
